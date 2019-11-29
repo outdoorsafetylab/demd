@@ -1,0 +1,9 @@
+.vscode
+*.o
+*.tif
+*.tfw
+*.zip
+*.7z
+*.hgt
+demd
+debian
