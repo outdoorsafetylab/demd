@@ -62,7 +62,7 @@ func main() {
 			for i := 0; i < requestsPerClient; i++ {
 				n := locationPerRequest
 				t0 := time.Now()
-				err := c.query(n)
+				err := c.query(n, i >= requestsPerClient-1)
 				if err != nil {
 					log.Printf("Failed to query for %dth request: %s", i+1, err.Error())
 					errCh <- err
@@ -104,7 +104,7 @@ type client struct {
 	url    string
 }
 
-func (c *client) query(n int) error {
+func (c *client) query(n int, close bool) error {
 	req, err := http.NewRequest("POST", c.url, bytes.NewBuffer([]byte(randLocs(n))))
 	if err != nil {
 		return err
@@ -112,6 +112,9 @@ func (c *client) query(n int) error {
 	req.Header.Set("Content-Type", "application/json")
 	if auth != "" {
 		req.Header.Set("Authorization", auth)
+	}
+	if close {
+		req.Header.Set("Connection", "close")
 	}
 	res, err := c.client.Do(req)
 	if err != nil {
