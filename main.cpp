@@ -28,6 +28,7 @@ static const char *defaultAddress = "0.0.0.0";
 static const int defaultPort = 80;
 static const char *defaultSRS = "WGS84";
 static const char *defaultURI = "/v1/elevations";
+static const char *defaultAuth = "";
 
 int main(int argc, char **argv) {
     struct context *ctx = NULL;
@@ -39,13 +40,15 @@ int main(int argc, char **argv) {
     const char *addr = defaultAddress;
     const char *srs = defaultSRS;
     const char *uri = defaultURI;
+    const char *auth = defaultAuth;
 
-    while ((opt = getopt(argc, argv, "a:p:u:s:")) != -1) {
+    while ((opt = getopt(argc, argv, "a:p:u:s:A:")) != -1) {
 		switch (opt) {
 			case 'a': addr = optarg; break;
 			case 'p': port = atoi(optarg); break;
 			case 'u': uri = optarg; break;
 			case 's': srs = optarg; break;
+			case 'A': auth = optarg; break;
 			default : fprintf(stderr, "Unknown option %c\n", opt); break;
 		}
 	}
@@ -57,12 +60,13 @@ int main(int argc, char **argv) {
 		fprintf(stdout, "    -p <port> : Port to bind HTTP (default: %d)\n", defaultPort);
 		fprintf(stdout, "    -u <URI>  : URI to serve REST (default: %s)\n", defaultURI);
 		fprintf(stdout, "    -s <SRS>  : SRS of requested coordinates (default: %s)\n", defaultSRS);
+		fprintf(stdout, "    -A <auth> : 'Authorization' header to control access, 401 status will be replied if not matched. (default: none)\n");
 		exit(1);
 	}
 
     const char *path = argv[optind];
     GDALAllRegister();
-    ctx = ContextCreate(path, srs);
+    ctx = ContextCreate(path, srs, auth);
     if (!ctx) {
 		ret = 1;
 		goto err;
