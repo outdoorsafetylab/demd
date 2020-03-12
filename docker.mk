@@ -12,7 +12,7 @@ PORT ?= 8082
 docker/build:
 	docker build --network=host --force-rm \
 		$(if $(call eq,$(no-cache),yes),--no-cache --pull,) \
-		--build-arg PORT=$(PORT)
+		--build-arg PORT=$(PORT) \
 		-t $(IMAGE_NAME) .
 
 # Run docker image.

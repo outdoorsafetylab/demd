@@ -15,7 +15,8 @@ FROM ubuntu:18.04 AS runtime
 
 RUN apt-get update && \
         apt-get install -y --no-install-recommends \ 
-        libevent-2.1-6 libgdal20
+        libevent-2.1-6 libgdal20 \
+        && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /usr/sbin/
 COPY --from=builder /source/demd /usr/sbin/
