@@ -29,6 +29,16 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
         return;
     }
 
+    const char *auth = ContextAuth(ctx);
+    if (auth) {
+        struct evkeyvalq *headers = evhttp_request_get_input_headers(req);
+        const char *value = evhttp_find_header(headers, "Authorization");
+        if (!value || strcmp(auth, value)) {
+            evhttp_send_error(req, 401, NULL);
+            return;
+        }
+    }
+
     output = evbuffer_new();
     if (!output) {
         fprintf(stderr, "Failed to allocate output buffer: %s\n", strerror(errno));

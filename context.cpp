@@ -26,10 +26,11 @@ LIST_HEAD(dataset_list, dataset_item);
 struct context {
     struct dataset_list datasets;
     size_t num_datasets;
+    char *auth;
 };
 
-context *ContextCreate(const char *path, const char *srs) {
-    struct context *ctx = (context *) calloc(sizeof(struct context), 1);
+struct context *ContextCreate(const char *path, const char *srs, const char *auth) {
+    struct context *ctx = (context *) calloc(1, sizeof(struct context));
     LIST_INIT(&ctx->datasets);
     DIR *d;
     struct dirent *ent;
@@ -52,12 +53,20 @@ context *ContextCreate(const char *path, const char *srs) {
     } else {
         printf("%s: %s\n", strerror(ENOENT), path);
     }
+    size_t n = strlen(auth);
+    if (n > 0) {
+        ctx->auth = (char *)malloc(n+1);
+        sprintf(ctx->auth, "%s", auth);
+    }
     return ctx;
 }
 
-void ContextFree(context *ctx) {
+void ContextFree(struct context *ctx) {
     if (!ctx) {
         return;
+    }
+    if (ctx->auth) {
+        free(ctx->auth);
     }
     struct dataset_item *item;
     LIST_FOREACH(item, &ctx->datasets, entry) {
@@ -69,27 +78,15 @@ void ContextFree(context *ctx) {
     free(ctx);
 }
 
-void contextAddDataset(struct context *ctx, const char *filepath, const char *srs) {
-    struct dataset *dataset = DatasetCreate(filepath, srs);
-    if (dataset) {
-        double top, left, bottom, right;
-        DatasetGetBounds(dataset, &top, &left, &bottom, &right);
-        printf("Dataset loaded: %s => (%f,%f,%f,%f)\n", filepath, top, left, bottom, right);
-        struct dataset_item *item = (struct dataset_item *) calloc(sizeof(struct dataset_item), 1);
-        item->dataset = dataset;
-        LIST_INSERT_HEAD(&ctx->datasets, item, entry);
-        ctx->num_datasets++;
-    } else {
-        printf("Failed to load dataset: %s => %s\n", filepath, strerror(errno));
-        return;
-    }
+const char *ContextAuth(struct context *ctx) {
+    return ctx->auth;
 }
 
-int ContextEmpty(context *ctx) {
+int ContextEmpty(struct context *ctx) {
     return LIST_EMPTY(&ctx->datasets);
 }
 
-double ContextGetAltitude(context *ctx, double x, double y) {
+double ContextGetAltitude(struct context *ctx, double x, double y) {
     struct dataset_item *item;
     double alt;
     LIST_FOREACH(item, &ctx->datasets, entry) {
@@ -99,6 +96,22 @@ double ContextGetAltitude(context *ctx, double x, double y) {
         }
     }
     return NAN;
+}
+
+void contextAddDataset(struct context *ctx, const char *filepath, const char *srs) {
+    struct dataset *dataset = DatasetCreate(filepath, srs);
+    if (dataset) {
+        double top, left, bottom, right;
+        DatasetGetBounds(dataset, &top, &left, &bottom, &right);
+        printf("Dataset loaded: %s => (%f,%f,%f,%f)\n", filepath, top, left, bottom, right);
+        struct dataset_item *item = (struct dataset_item *) calloc(1, sizeof(struct dataset_item));
+        item->dataset = dataset;
+        LIST_INSERT_HEAD(&ctx->datasets, item, entry);
+        ctx->num_datasets++;
+    } else {
+        printf("Failed to load dataset: %s => %s\n", filepath, strerror(errno));
+        return;
+    }
 }
 
 int endsWith(const char *str, const char *suffix) {

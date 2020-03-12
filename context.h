@@ -2,9 +2,10 @@
 #define CONTEXT_H_
 
 struct context;
-struct context *ContextCreate(const char *, const char *);
+struct context *ContextCreate(const char *, const char *, const char *);
 void ContextFree(struct context *);
-int ContextEmpty(context *ctx);
+const char *ContextAuth(struct context *ctx);
+int ContextEmpty(struct context *ctx);
 double ContextGetAltitude(struct context *, double, double);
 
 #endif // CONTEXT_H_
