@@ -40,7 +40,7 @@ sudo apt-get install libevent-2.1-6 libgdal20
 Use `run` target in `Makefile` to automatically download sample DEM files before starting the daemon:
 
 ```shell
-$ make run
+$ make serve
 ./demd -p 8082 dem
 Dataset loaded: dem/N21E120.hgt => (22.000417,119.999583,20.999583,121.000417)
 Dataset loaded: dem/N23E121.hgt => (24.000417,120.999583,22.999583,122.000417)

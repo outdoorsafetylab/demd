@@ -27,12 +27,14 @@ var (
 	clients            int
 	requestsPerClient  int
 	locationPerRequest int
+	auth               string
 )
 
 func main() {
 	flag.StringVar(&host, "h", "http://127.0.0.1:8082", "base URL of test target")
-	flag.IntVar(&clients, "c", 1, "number of clients")
-	flag.IntVar(&requestsPerClient, "r", 10, "requests per client")
+	flag.StringVar(&auth, "a", "", "'Authorization' header")
+	flag.IntVar(&clients, "c", 50, "number of clients")
+	flag.IntVar(&requestsPerClient, "r", 50, "requests per client")
 	flag.IntVar(&locationPerRequest, "l", 1000, "locations per request")
 	flag.Usage = usage
 	flag.Parse()
@@ -42,8 +44,10 @@ func main() {
 	url := host + "/v1/elevations"
 	errCh := make(chan error)
 	countCh := make(chan int)
+	durationCh := make(chan time.Duration)
 	total := clients * requestsPerClient * locationPerRequest
 	count := 0
+	var duration time.Duration
 	log.Printf("Testing: %s", host)
 	log.Printf("Number of clients: %d", clients)
 	log.Printf("Requests per client: %d", requestsPerClient)
@@ -57,12 +61,14 @@ func main() {
 		go func(c *client) {
 			for i := 0; i < requestsPerClient; i++ {
 				n := locationPerRequest
-				err := c.query(n)
+				t0 := time.Now()
+				err := c.query(n, i >= requestsPerClient-1)
 				if err != nil {
 					log.Printf("Failed to query for %dth request: %s", i+1, err.Error())
 					errCh <- err
 					return
 				}
+				durationCh <- time.Now().Sub(t0)
 				countCh <- n
 			}
 		}(c)
@@ -71,18 +77,21 @@ func main() {
 		select {
 		case n := <-countCh:
 			count += n
+		case dt := <-durationCh:
+			duration += dt
 		case <-errCh:
 			log.Printf("Aborted at %d queries.", count)
 			os.Exit(1)
 		}
 		if count >= total {
-			log.Printf("Finished %d queries.", total)
+			log.Printf("Finished %d elevation queries by %d requests.", total, clients*requestsPerClient)
 			break
 		}
 	}
 	dt := time.Now().Sub(t0)
-	log.Printf("Average time per elevation: %v", dt/time.Duration(total))
-	log.Printf("Throughput: %d elevations/sec", time.Second*time.Duration(total)/dt)
+	log.Printf("Time elapsed: %v", dt)
+	log.Printf("Average RTT per request: %v", duration/time.Duration(clients*requestsPerClient))
+	log.Printf("Average throughput: %d elevations/sec", time.Second*time.Duration(total)/dt)
 }
 
 func usage() {
@@ -95,19 +104,34 @@ type client struct {
 	url    string
 }
 
-func (c *client) query(n int) error {
-	res, err := c.client.Post(c.url, "application/json", bytes.NewBuffer([]byte(randLocs(n))))
+func (c *client) query(n int, close bool) error {
+	req, err := http.NewRequest("POST", c.url, bytes.NewBuffer([]byte(randLocs(n))))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	if close {
+		req.Header.Set("Connection", "close")
+	}
+	res, err := c.client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
-	defer ioutil.ReadAll(res.Body)
+	_, err = ioutil.ReadAll(res.Body)
+	if err != nil {
+		return err
+	}
 	if res.StatusCode != 200 {
 		return errors.New(res.Status)
 	}
 	return nil
 }
 
+// we don't use json.Marshal() here to maximize client strenth
 func randLocs(n int) string {
 	locs := make([]string, n)
 	for i := 0; i < n; i++ {

@@ -2,16 +2,15 @@ EXEC := demd
 CC := g++
 LDFLAGS ?=
 LIBS ?= -lgdal -levent -ljson-c
-SOURCES := $(wildcard *.cpp)
+SRCS := $(wildcard *.cpp)
 # Objs are all the sources, with .cpp replaced by .o
-OBJS := $(SOURCES:.cpp=.o)
+OBJS := $(SRCS:.cpp=.o)
 
 DEM := dem
 HGT := $(DEM)/N23E120.hgt
 
 PORT ?= 8082
 STRESS_ARG ?= -c 10
-
 all: $(EXEC)
 
 dem: $(HGT)
@@ -25,7 +24,7 @@ $(EXEC): $(OBJS)
 %.o: %.cpp
 	$(CC) -o $@ $(strip $(CFLAGS) $(INCLUDES) )-c $<
 
-run: $(EXEC) $(HGT)
+serve: $(EXEC) $(HGT)
 	./$(EXEC) -p $(PORT) $(DEM)
 
 profile: $(EXEC) $(HGT)
