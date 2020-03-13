@@ -1,6 +1,6 @@
 # Elevation service hosting DTM files
 
-This provides a REST API service for querying elevations defined in DTM files. It is implemented in C++, with GDAL, libevent, and JSON-C. If you are familiar with `gdal` commands, you could image this as a daemonized and enhanced `gdallocationinfo`.
+This provides a REST API service for querying elevations defined in DTM files. It is implemented in C++, with GDAL, libevent, and JSON-C. If you are familiar with `gdal` commands, you could imagine this as a daemonized and enhanced `gdallocationinfo`.
 
 # Why not just use `gdallocationinfo`?
 
