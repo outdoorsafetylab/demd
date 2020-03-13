@@ -3,6 +3,7 @@ IMAGE_NAME := outdoorsafetylab/demd
 REPO_NAME ?= outdoorsafetylab/demd
 VERSION ?= $(subst v,,$(shell git describe --tags --exact-match 2>/dev/null || echo ""))
 PORT ?= 8082
+DEMS ?= $(realpath dem)
 
 # Build docker image.
 #
@@ -20,10 +21,10 @@ docker/build:
 # Usage:
 #	make docker/run
 
-docker/run:
+docker/run: $(HGT)
 	docker run -it --rm \
 		-p $(PORT):$(PORT) \
-		--volume "/tmp/dem:/var/lib/dem" \
+		--volume "$(DEMS):/var/lib/dem" \
 		$(IMAGE_NAME)
 
 # Tag docker images.

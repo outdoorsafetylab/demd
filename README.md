@@ -1,8 +1,6 @@
 # Elevation Service for DTM Files
 
-This project provides an elevation service with REST API. It is implemented in C++, with GDAL, libevent, and JSON-C.
-
-We also built a [cloud-based service](https://outdoorsafetylab.org/elevation_api) backed by this project.
+This project provides an elevation service based on REST API. It is implemented in C++, with GDAL, libevent, and JSON-C.
 
 ## How to Build
 
@@ -27,6 +25,7 @@ Options:
     -p <port> : Port to bind HTTP (default: 80)
     -u <URI>  : URI to serve REST (default: /v1/elevations)
     -s <SRS>  : SRS of requested coordinates (default: WGS84)
+    -A <auth> : 'Authorization' header to control access, 401 status will be replied if not matched. (default: none)
 ```
 
 ## How to Run
@@ -37,7 +36,7 @@ If development packages was not installed, you may need the follow runtime depen
 sudo apt-get install libevent-2.1-6 libgdal20
 ```
 
-Use `run` target in `Makefile` to automatically download sample DEM files before starting the daemon:
+Or use `serve` target in `Makefile` to automatically download sample DEM files before starting the daemon:
 
 ```shell
 $ make serve
