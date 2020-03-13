@@ -24,7 +24,7 @@ docker/build:
 docker/run: $(HGT)
 	docker run -it --rm \
 		-p $(PORT):$(PORT) \
-		--volume "$(DEMS):/var/lib/dem" \
+		-v "$(DEMS):/var/lib/dem" \
 		$(IMAGE_NAME)
 
 # Tag docker images.

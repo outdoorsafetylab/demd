@@ -1,8 +1,12 @@
-# Elevation Service for DTM Files
+# Elevation service hosting DTM files
 
 This project provides an elevation service based on REST API. It is implemented in C++, with GDAL, libevent, and JSON-C.
 
-## How to Build
+# Why not just use `gdallocationinfo`?
+
+Yes, you can just use `gdallocationinfo`. But every command of it forks a new process, and then open a DTM file just to query a single elevation for you. On the contrary, `demd` hosts multiple DTM files as a daemon (server, or service) and are capable to query multiple elevations in the same API request. If you care about performance and resource utilization, it will be a good investment to run a micro elevation service.
+
+## How to build
 
 This project was developed on Ubuntu 18.04 LTS. You will need to install the following packages by ```apt-get``` before building it:
 
@@ -28,7 +32,7 @@ Options:
     -A <auth> : 'Authorization' header to control access, 401 status will be replied if not matched. (default: none)
 ```
 
-## How to Run
+## How to run
 
 If development packages was not installed, you may need the follow runtime dependency packages installed:
 
@@ -59,6 +63,6 @@ $ curl -XPOST --data '[[120.957283,23.47]]' http://127.0.0.1:8082/v1/elevations
 [ 3917 ]
 ```
 
-## API Specification
+## API specification
 
 See the [OpenAPI 3.0 specification](https://outdoorsafetylab.org/elevation_api.html).
