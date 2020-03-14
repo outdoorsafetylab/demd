@@ -24,7 +24,7 @@ Yes, you can just use `gdallocationinfo`. But every command of it forks a new pr
 
 # How to build
 
-This project was developed on Ubuntu 18.04 LTS. You will need to install the following packages by ```apt-get``` before building it:
+This project was developed on Ubuntu 18.04 LTS. You will need to install the following packages by `apt-get` before building it:
 
 ```shell
 sudo apt-get install build-essential libgdal-dev libevent-dev libjson-c-dev
