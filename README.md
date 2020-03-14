@@ -6,7 +6,23 @@ This provides a REST API service for querying elevations defined in DTM files. I
 
 Yes, you can just use `gdallocationinfo`. But every command of it forks a new process, and then open a DTM file just to query a single elevation for you. On the contrary, `demd` hosts multiple DTM files as a daemon (server, or service) and are capable to query multiple elevations in the same API request. If you care about performance and resource utilization, it will be a good investment to run a micro elevation service.
 
-## How to build
+# How to use (as docker container)
+
+1. Prepare DTM files in a folder. If you don't have any DTM, you can download some from [Viewfinder Panoramas](http://viewfinderpanoramas.org/). The fastest way is to pick up from its [world map](http://www.viewfinderpanoramas.org/Coverage%20map%20viewfinderpanoramas_org3.htm).
+1. Start a container (replace `/path/to/your/dtms` with the real path of your DTM files):
+    ```shell
+    docker run -it --rm -p 8082:8082 -v "/path/to/your/dtms:/var/lib/dem" outdoorsafetylab/demd
+    ```
+1. Try to query a elevation of somewhere you are familiar with. For example, to query the elevation of Mt. Jade, highest peak of Taiwan:
+    ```shell
+    curl -XPOST --data '[[120.957283,23.47]]' http://127.0.0.1:8082/v1/elevations
+    ```
+1. You can also cross-check with `gdallocationinfo` command:
+    ```shell
+    gdallocationinfo -wgs84 -valonly N23E120.hgt 120.957283 23.47
+    ```
+
+# How to build
 
 This project was developed on Ubuntu 18.04 LTS. You will need to install the following packages by ```apt-get``` before building it:
 
@@ -32,7 +48,7 @@ Options:
     -A <auth> : 'Authorization' header to control access, 401 status will be replied if not matched. (default: none)
 ```
 
-## How to run
+# How to run
 
 If development packages was not installed, you may need the follow runtime dependency packages installed:
 
@@ -56,13 +72,13 @@ Dataset loaded: dem/N21E121.hgt => (22.000417,120.999583,20.999583,122.000417)
 Serving http://0.0.0.0:8082/v1/elevations
 ```
 
-To query the elevation of Mt. Jade, highest peak of Taiwan, of this test daemon:
+To query the elevation of Mt. Jade, highest peak of Taiwan:
 
 ```shell
 $ curl -XPOST --data '[[120.957283,23.47]]' http://127.0.0.1:8082/v1/elevations
 [ 3917 ]
 ```
 
-## API specification
+# API specification
 
 See the [OpenAPI 3.0 specification](https://outdoorsafetylab.org/elevation_api.html).
