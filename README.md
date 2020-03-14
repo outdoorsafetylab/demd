@@ -9,7 +9,7 @@ Yes, you can just use `gdallocationinfo`. But every command of it forks a new pr
 # How to use (as docker container)
 
 1. Prepare DTM files in a folder. If you don't have any DTM, you can download some from [Viewfinder Panoramas](http://viewfinderpanoramas.org/). The fastest way is to pick up from its [world map](http://www.viewfinderpanoramas.org/Coverage%20map%20viewfinderpanoramas_org3.htm).
-1. Start a container (replace `/path/to/your/dtms` with the real path of your DTM files):
+1. Start a container running our public [docker image](https://hub.docker.com/r/outdoorsafetylab/demd) (replace `/path/to/your/dtms` with the real path of your DTM files):
     ```shell
     docker run -it --rm -p 8082:8082 -v "/path/to/your/dtms:/var/lib/dem" outdoorsafetylab/demd
     ```
