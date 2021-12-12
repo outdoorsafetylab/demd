@@ -16,7 +16,7 @@ steps:
   - -t
   - outdoorsafetylab/demd
   - -f
-  - .docker/Dockerfile
+  - Dockerfile
   - .
 - name: gcr.io/cloud-builders/docker
   args:
