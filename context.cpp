@@ -9,6 +9,7 @@
 #include <math.h>
 
 #include "dataset.h"
+#include "context.h"
 
 static int endsWith(const char *str, const char *suffix);
 static void joinPath(char *dst, size_t n, const char *dir, const char *file);
@@ -26,12 +27,19 @@ LIST_HEAD(dataset_list, dataset_item);
 struct context {
     struct dataset_list datasets;
     size_t num_datasets;
+    size_t max_points;
+    int verbose;
     char *auth;
 };
 
 struct context *ContextCreate(const char *path, const char *srs, const char *auth) {
     struct context *ctx = (context *) calloc(1, sizeof(struct context));
+    if (!ctx) {
+        fprintf(stderr, "Failed to allocate context: %s\n", strerror(errno));
+        return NULL;
+    }
     LIST_INIT(&ctx->datasets);
+    ctx->verbose = 1;
     DIR *d;
     struct dirent *ent;
     char filepath[1024];
@@ -46,17 +54,22 @@ struct context *ContextCreate(const char *path, const char *srs, const char *aut
                     }
                 }
                 closedir(d);
+            } else {
+                fprintf(stderr, "Failed to open directory %s: %s\n", path, strerror(errno));
             }
         } else {
             contextAddDataset(ctx, path, srs);
         }
     } else {
-        printf("%s: %s\n", strerror(ENOENT), path);
+        fprintf(stderr, "%s: %s\n", strerror(ENOENT), path);
     }
-    size_t n = strlen(auth);
-    if (n > 0) {
-        ctx->auth = (char *)malloc(n+1);
-        sprintf(ctx->auth, "%s", auth);
+    if (strlen(auth) > 0) {
+        ctx->auth = strdup(auth);
+        if (!ctx->auth) {
+            fprintf(stderr, "Failed to allocate auth: %s\n", strerror(errno));
+            ContextFree(ctx);
+            return NULL;
+        }
     }
     return ctx;
 }
@@ -68,12 +81,16 @@ void ContextFree(struct context *ctx) {
     if (ctx->auth) {
         free(ctx->auth);
     }
-    struct dataset_item *item;
-    LIST_FOREACH(item, &ctx->datasets, entry) {
+    // Cannot use LIST_FOREACH here: it advances through the entry that the
+    // body just freed.
+    struct dataset_item *item = LIST_FIRST(&ctx->datasets);
+    while (item) {
+        struct dataset_item *next = LIST_NEXT(item, entry);
         if (item->dataset) {
             DatasetFree(item->dataset);
         }
         free(item);
+        item = next;
     }
     free(ctx);
 }
@@ -84,6 +101,22 @@ const char *ContextAuth(struct context *ctx) {
 
 int ContextEmpty(struct context *ctx) {
     return LIST_EMPTY(&ctx->datasets);
+}
+
+void ContextSetMaxPoints(struct context *ctx, size_t max) {
+    ctx->max_points = max;
+}
+
+size_t ContextMaxPoints(struct context *ctx) {
+    return ctx->max_points;
+}
+
+void ContextSetVerbose(struct context *ctx, int verbose) {
+    ctx->verbose = verbose;
+}
+
+int ContextVerbose(struct context *ctx) {
+    return ctx->verbose;
 }
 
 double ContextGetAltitude(struct context *ctx, double x, double y) {
@@ -100,18 +133,22 @@ double ContextGetAltitude(struct context *ctx, double x, double y) {
 
 void contextAddDataset(struct context *ctx, const char *filepath, const char *srs) {
     struct dataset *dataset = DatasetCreate(filepath, srs);
-    if (dataset) {
-        double top, left, bottom, right;
-        DatasetGetBounds(dataset, &top, &left, &bottom, &right);
-        printf("Dataset loaded: %s => (%f,%f,%f,%f)\n", filepath, top, left, bottom, right);
-        struct dataset_item *item = (struct dataset_item *) calloc(1, sizeof(struct dataset_item));
-        item->dataset = dataset;
-        LIST_INSERT_HEAD(&ctx->datasets, item, entry);
-        ctx->num_datasets++;
-    } else {
-        printf("Failed to load dataset: %s => %s\n", filepath, strerror(errno));
+    if (!dataset) {
+        fprintf(stderr, "Failed to load dataset: %s\n", filepath);
         return;
     }
+    struct dataset_item *item = (struct dataset_item *) calloc(1, sizeof(struct dataset_item));
+    if (!item) {
+        fprintf(stderr, "Failed to allocate dataset item: %s\n", strerror(errno));
+        DatasetFree(dataset);
+        return;
+    }
+    double top, left, bottom, right;
+    DatasetGetBounds(dataset, &top, &left, &bottom, &right);
+    printf("Dataset loaded: %s => (%f,%f,%f,%f)\n", filepath, top, left, bottom, right);
+    item->dataset = dataset;
+    LIST_INSERT_HEAD(&ctx->datasets, item, entry);
+    ctx->num_datasets++;
 }
 
 int endsWith(const char *str, const char *suffix) {
@@ -139,6 +176,8 @@ int exist(const char *path) {
 
 int isDir(const char *path) {
     struct stat st;
-    stat(path, &st);
+    if (stat(path, &st) != 0) {
+        return 0;
+    }
     return S_ISDIR(st.st_mode);
 }

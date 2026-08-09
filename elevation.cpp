@@ -1,11 +1,19 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <string.h>
 #include <math.h>
+#include <sys/time.h>
 
 #include <event2/buffer.h>
 #include <event2/http.h>
 #include <json-c/json.h>
+
+#if JSON_C_VERSION_NUM < 0x000D00
+#error "json-c 0.13 or newer is required for json_tokener_get_parse_end()"
+#endif
 
 #include "context.h"
 
@@ -13,12 +21,14 @@
 
 static const char *contentType = "application/json; charset=utf-8";
 
+static int coordValue(json_object *obj, double *val);
+
 void elevation_request_cb(struct evhttp_request *req, void *arg) {
     context *ctx = (context *)arg;
     char *data = NULL;
     json_object *coords, *json = NULL, *result = NULL;
-    size_t len;
-    int n;
+    json_tokener *tok = NULL;
+    size_t len, end, n, max;
     evbuffer *input, *output = NULL;
 
     switch (evhttp_request_get_command(req)) {
@@ -52,34 +62,64 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
     }
 
     len = evbuffer_get_length(input);
-    if (len <= 0) {
+    if (len == 0) {
         evhttp_send_error(req, 400, NULL);
+        goto done;
+    }
+    if (len > INT_MAX) {
+        evhttp_send_error(req, 413, NULL);
         goto done;
     }
 
     data = (char *) malloc(len);
-    if (evbuffer_copyout(input, data, len) != len) {
+    if (!data) {
+        fprintf(stderr, "Failed to allocate %zu bytes for input: %s\n", len, strerror(errno));
+        goto err;
+    }
+    if (evbuffer_copyout(input, data, len) != (ev_ssize_t) len) {
         fprintf(stderr, "Failed to drain input buffer: %s\n", strerror(errno));
         goto err;
     }
 
-    json_tokener_error err;
-    json = json_tokener_parse_verbose(data, &err);
-    if (!json) {
-        fprintf(stderr, "Failed to parse input buffer: %s\n", json_tokener_error_desc(err));
+    // Parse with an explicit length: the buffer is not NUL-terminated, so the
+    // string-oriented entry points would read past the end of the allocation.
+    tok = json_tokener_new();
+    if (!tok) {
+        fprintf(stderr, "Failed to allocate JSON tokener: %s\n", strerror(errno));
         goto err;
     }
-    
+    json = json_tokener_parse_ex(tok, data, (int) len);
+    if (!json) {
+        fprintf(stderr, "Failed to parse input buffer: %s\n",
+            json_tokener_error_desc(json_tokener_get_error(tok)));
+        evhttp_send_error(req, 400, NULL);
+        goto done;
+    }
+
+    // The body must be exactly one JSON document. json-c stops at the end of
+    // the first complete value and ignores whatever follows it.
+    end = json_tokener_get_parse_end(tok);
+    while (end < len && isspace((unsigned char) data[end])) {
+        end++;
+    }
+    if (end != len) {
+        evhttp_send_error(req, 400, NULL);
+        goto done;
+    }
+
     if (!json_object_is_type(json, json_type_array)) {
         evhttp_send_error(req, 400, NULL);
         goto done;
     }
 
     n = json_object_array_length(json);
-    if (n < 0) {
-        evhttp_send_error(req, 400, NULL);
+    max = ContextMaxPoints(ctx);
+    if (max > 0 && n > max) {
+        fprintf(stderr, "Rejected request of %zu point(s), limit is %zu\n", n, max);
+        evhttp_send_error(req, 413, NULL);
         goto done;
-    } else if (n == 0) {
+    }
+    if (n == 0) {
         evbuffer_add(output, "[]", 2);
     } else {
         struct timeval start, end;
@@ -89,21 +129,18 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
             fprintf(stderr, "Failed to create JSON array for results: %s\n", strerror(errno));
             goto err;
         }
-        for (int i = 0; i < n; i++) {
+        for (size_t i = 0; i < n; i++) {
             coords = json_object_array_get_idx(json, i);
-            if (json_object_array_length(coords) != 2) {
+            // json-c represents JSON null as a NULL pointer, and its array
+            // accessors are unchecked, so the type has to be proven first.
+            if (!coords || !json_object_is_type(coords, json_type_array)
+                    || json_object_array_length(coords) != 2) {
                 evhttp_send_error(req, 400, NULL);
                 goto done;
             }
-            json_object *x = json_object_array_get_idx(coords, 0);
-            json_object *y = json_object_array_get_idx(coords, 1);
-            double xVal = json_object_get_double(x);
-            if (errno == EINVAL) {
-                evhttp_send_error(req, 400, NULL);
-                goto done;
-            }
-            double yVal = json_object_get_double(y);
-            if (errno == EINVAL) {
+            double xVal, yVal;
+            if (!coordValue(json_object_array_get_idx(coords, 0), &xVal)
+                    || !coordValue(json_object_array_get_idx(coords, 1), &yVal)) {
                 evhttp_send_error(req, 400, NULL);
                 goto done;
             }
@@ -127,7 +164,9 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
             usec += 1000000;
             sec--;
         }
-        fprintf(stderr, "Lookup %d point(s) in %ld.%06ld sec\n", n, sec, usec);
+        if (ContextVerbose(ctx)) {
+            fprintf(stderr, "Lookup %zu point(s) in %ld.%06ld sec\n", n, sec, usec);
+        }
     }
     evhttp_add_header(evhttp_request_get_output_headers(req), "Content-Type", contentType);
     evhttp_send_reply(req, 200, "OK", output);
@@ -144,7 +183,26 @@ done:
     if (json) {
         json_object_put(json);
     }
+    if (tok) {
+        json_tokener_free(tok);
+    }
     if (data) {
         free(data);
+    }
+}
+
+// Accepts only JSON numbers. json_object_get_double() coerces anything else to
+// 0.0 without reporting an error, so the type has to be checked up front.
+int coordValue(json_object *obj, double *val) {
+    if (!obj) {
+        return 0;
+    }
+    switch (json_object_get_type(obj)) {
+    case json_type_int:
+    case json_type_double:
+        *val = json_object_get_double(obj);
+        return isfinite(*val);
+    default:
+        return 0;
     }
 }

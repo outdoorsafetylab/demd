@@ -24,11 +24,15 @@ Yes, you can just use `gdallocationinfo`. But every command of it forks a new pr
 
 # How to build
 
-This project was developed on Ubuntu 18.04 LTS. You will need to install the following packages by `apt-get` before building it:
+This project is built and tested on Ubuntu 24.04 LTS (GDAL 3.8, libevent 2.1, json-c 0.17). You will need to install the following packages by `apt-get` before building it:
 
 ```shell
-sudo apt-get install build-essential libgdal-dev libevent-dev libjson-c-dev
+sudo apt-get install build-essential pkg-config libgdal-dev libevent-dev libjson-c-dev
 ```
+
+GDAL 3 or newer and json-c 0.13 or newer are required. Include paths and link
+flags are resolved through `gdal-config` and `pkg-config`, so no distribution
+specific paths are hard-coded.
 
 To build:
 
@@ -46,14 +50,28 @@ Options:
     -u <URI>  : URI to serve REST (default: /v1/elevations)
     -s <SRS>  : SRS of requested coordinates (default: WGS84)
     -A <auth> : 'Authorization' header to control access, 401 status will be replied if not matched. (default: none)
+    -m <max>  : Maximum number of points per request, 0 for unlimited (default: 100000)
+    -q        : Do not log every lookup
 ```
+
+# How to test
+
+The test suite synthesizes its own DEM tiles, so no data needs to be downloaded:
+
+```shell
+make test           # end-to-end tests against a normal build
+make test/sanitize  # the same tests under AddressSanitizer and UBSan
+```
+
+`make test/sanitize` is the one that matters for memory safety — `-Wall -Wextra`
+does not detect the class of bug the suite guards against. Both run in CI.
 
 # How to run
 
 If development packages was not installed, you may need the follow runtime dependency packages installed:
 
 ```shell
-sudo apt-get install libevent-2.1-6 libgdal20
+sudo apt-get install libgdal34t64 libevent-2.1-7t64 libjson-c5
 ```
 
 Or use `serve` target in `Makefile` to automatically download sample DEM files before starting the daemon:
