@@ -123,6 +123,14 @@ def check_no_sanitizer(name, output):
     check(name, True, True)
 
 
+def check_shutdown(name, server, sig=signal.SIGTERM):
+    """Teardown is where the dataset list is walked and freed, so every server
+    has to be stopped deliberately and inspected after it exits -- a scan taken
+    while it is still running cannot see a fault in that path."""
+    check("%s: clean exit" % name, 0, server.shutdown(sig))
+    check_clean("%s: clean after exit" % name, server)
+
+
 def check_clean(name, server):
     """Sanitizer reports go to the server's stderr, not to any response."""
     out = server.output()
@@ -199,8 +207,7 @@ def main(binary):
     check("Kaohsiung  [120.3, 22.63]", [5000], t.post("[[120.3,22.63]]")[1])
     check("swapped axes -> null", [None], t.post("[[23.47,120.957283]]")[1])
     check("far outside -> null", [None], t.post("[[0.0,0.0]]")[1])
-    check_clean("no sanitizer findings (projected)", t)
-    t.shutdown()
+    check_shutdown("projected", t)
 
     print("== rotated geotransform ==")
     # Corner projection is order-dependent only when the geotransform has
@@ -228,8 +235,7 @@ def main(binary):
     check("rotated: Kaohsiung", [5000], r.post("[[120.3,22.63]]")[1])
     check("rotated: Hualien", [5000], r.post("[[121.6,23.99]]")[1])
     check("rotated: far outside -> null", [None], r.post("[[0.0,0.0]]")[1])
-    check_clean("no sanitizer findings (rotated)", r)
-    r.shutdown()
+    check_shutdown("rotated", r)
 
     print("== protocol ==")
     check("GET -> 405", 405, s.post("[]", method="GET")[0])
@@ -244,8 +250,7 @@ def main(binary):
     check("10 points -> 200", 200, s.post("[" + "[120.25,23.75]," * 9 + "[120.25,23.75]]")[0])
     check("oversized body -> rejected", True, s.post("[" + "[120.25,23.75]," * 50000 + "[1,2]]")[0] != 200)
     check("server survived oversized body", True, s.alive())
-    check_clean("no sanitizer findings (limits)", s)
-    s.shutdown()
+    check_shutdown("limits", s)
 
     print("== dataset precedence ==")
     # Real deployments layer a current dataset over an older one that still
@@ -262,18 +267,18 @@ def main(binary):
     check("hi first: NE from hi", [2000], p.post("[[120.75,23.75]]")[1])
     check("hi first: NW hole filled by lo", [9999], p.post("[[120.25,23.75]]")[1])
     check("hi first: SW from hi", [3000], p.post("[[120.25,23.25]]")[1])
-    p.shutdown()
+    check_shutdown("precedence hi,lo", p)
 
     p = Server(binary, [lo, hi])
     check("lo first: NE from lo", [9999], p.post("[[120.75,23.75]]")[1])
     check("lo first: NW from lo", [9999], p.post("[[120.25,23.75]]")[1])
-    p.shutdown()
+    check_shutdown("precedence lo,hi", p)
 
     # A single file argument still works, and mixes with directories.
     p = Server(binary, [os.path.join(hi, "N23E120.hgt"), lo])
     check("file arg then dir: NE from file", [2000], p.post("[[120.75,23.75]]")[1])
     check("file arg then dir: NW from dir", [9999], p.post("[[120.25,23.75]]")[1])
-    p.shutdown()
+    check_shutdown("precedence file,dir", p)
 
     # Within one directory the order is alphabetical, not readdir order.
     both = tempfile.mkdtemp(prefix="demd-test-both-")
@@ -283,8 +288,7 @@ def main(binary):
                            "--value", "2222", os.path.join(both, "b.tif")])
     p = Server(binary, both)
     check("same dir: a.tif before b.tif", [1111], p.post("[[120.957283,23.47]]")[1])
-    check_clean("no sanitizer findings (precedence)", p)
-    p.shutdown()
+    check_shutdown("precedence same dir", p)
 
     print("== argument validation ==")
     # 0 legitimately means "unlimited", so anything that silently converts to
@@ -295,7 +299,7 @@ def main(binary):
     for good in ("0", "1", "100000"):
         s2 = Server(binary, demdir, "-m", good)
         check("-m %-24r accepted" % good, True, s2.alive())
-        s2.shutdown()
+        check_shutdown("-m %s" % good, s2)
 
     print("== invalid SRS (the path that used to leak) ==")
     # sanitizeSRS() returned early on OSRSetFromUserInput() failure without
