@@ -4,7 +4,10 @@
 #include <stddef.h>
 
 struct context;
-struct context *ContextCreate(const char *, const char *, const char *);
+// Paths are consulted in the order given, and the files inside a directory in
+// sorted order. The first dataset that yields a value for a coordinate wins,
+// so earlier paths take precedence over later ones.
+struct context *ContextCreate(const char **paths, size_t npaths, const char *, const char *);
 void ContextFree(struct context *);
 const char *ContextAuth(struct context *ctx);
 int ContextEmpty(struct context *ctx);

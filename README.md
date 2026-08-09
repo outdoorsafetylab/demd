@@ -43,7 +43,7 @@ make
 A executable file `demd` will be created. You can run it to see the help:
 
 ```shell
-Usage: ./demd [options] <DEM file or directory of DEM files>
+Usage: ./demd [options] <DEM file or directory>...
 Options:
     -a <addr> : Address to bind HTTP (default: 0.0.0.0)
     -p <port> : Port to bind HTTP (default: 80)
@@ -52,7 +52,26 @@ Options:
     -A <auth> : 'Authorization' header to control access, 401 status will be replied if not matched. (default: none)
     -m <max>  : Maximum number of points per request, 0 for unlimited (default: 100000)
     -q        : Do not log every lookup
+
+Paths are searched in the order given, and files within a directory in
+sorted order. The first dataset holding a value for a coordinate wins,
+so put higher-priority data first.
 ```
+
+# Layering datasets
+
+Elevation data is rarely a single clean set: a new survey usually supersedes an
+older one over most of the area while dropping coverage somewhere the old one
+still has. Pass both, newest first:
+
+```shell
+./demd -p 8082 /var/lib/dem/current /var/lib/dem/fallback
+```
+
+Every coordinate is tried against each dataset in that order, and the first one
+holding a value answers. Where the current data has a hole, the fallback fills
+it; everywhere else the current data wins. Ordering is explicit rather than
+dependent on directory iteration, so the result does not change between hosts.
 
 # How to test
 

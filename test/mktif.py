@@ -39,10 +39,10 @@ SHORT, LONG, DOUBLE = 3, 4, 12
 MODEL_PIXEL_SCALE, MODEL_TRANSFORMATION, MODEL_TIEPOINT = 33550, 34264, 33922
 
 
-def main(path, rotated=False):
+def main(path, rotated=False, value=VALUE):
     width, height = (ROT_SIZE, ROT_SIZE) if rotated else (WIDTH, HEIGHT)
     pixels = width * height
-    data = struct.pack("<%dh" % pixels, *([VALUE] * pixels))
+    data = struct.pack("<%dh" % pixels, *([value] * pixels))
 
     if rotated:
         t = math.radians(ROT_ANGLE)
@@ -128,6 +128,11 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     rotated = "--rotated" in args
     args = [a for a in args if a != "--rotated"]
+    value = VALUE
+    if "--value" in args:
+        i = args.index("--value")
+        value = int(args[i + 1])
+        del args[i:i + 2]
     if len(args) != 1:
-        sys.exit("usage: mktif.py [--rotated] <output.tif>")
-    main(args[0], rotated)
+        sys.exit("usage: mktif.py [--rotated] [--value N] <output.tif>")
+    main(args[0], rotated, value)

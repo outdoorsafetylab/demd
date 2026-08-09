@@ -43,11 +43,13 @@ def free_port():
 
 
 class Server:
-    def __init__(self, binary, demdir, *args):
+    def __init__(self, binary, dems, *args):
+        if isinstance(dems, str):
+            dems = [dems]
         self.port = free_port()
         self.log = tempfile.TemporaryFile(mode="w+")
         self.proc = subprocess.Popen(
-            [binary, "-p", str(self.port), *args, demdir],
+            [binary, "-p", str(self.port), *args, *dems],
             stdout=self.log, stderr=subprocess.STDOUT,
         )
         self.url = "http://127.0.0.1:%d/v1/elevations" % self.port
@@ -84,7 +86,7 @@ class Server:
 
     def bounds(self):
         """(top, left, bottom, right) from the startup line, in the request SRS."""
-        m = re.search(r"Dataset loaded: \S+ => \(([-\d.,]+)\)", self.output())
+        m = re.search(r"Dataset \d+ loaded: \S+ => \(([-\d.,]+)\)", self.output())
         if not m:
             return None
         return tuple(float(v) for v in m.group(1).split(","))
@@ -244,6 +246,45 @@ def main(binary):
     check("server survived oversized body", True, s.alive())
     check_clean("no sanitizer findings (limits)", s)
     s.shutdown()
+
+    print("== dataset precedence ==")
+    # Real deployments layer a current dataset over an older one that still
+    # covers ground the new survey dropped. Which one answers must depend on
+    # the order the operator gave, not on directory iteration order.
+    hi = tempfile.mkdtemp(prefix="demd-test-hi-")
+    lo = tempfile.mkdtemp(prefix="demd-test-lo-")
+    subprocess.check_call([sys.executable, os.path.join(HERE, "mkdem.py"),
+                           "--hole-nw", os.path.join(hi, "N23E120.hgt")])
+    subprocess.check_call([sys.executable, os.path.join(HERE, "mkdem.py"),
+                           "--fill", "9999", os.path.join(lo, "N23E120.hgt")])
+
+    p = Server(binary, [hi, lo])
+    check("hi first: NE from hi", [2000], p.post("[[120.75,23.75]]")[1])
+    check("hi first: NW hole filled by lo", [9999], p.post("[[120.25,23.75]]")[1])
+    check("hi first: SW from hi", [3000], p.post("[[120.25,23.25]]")[1])
+    p.shutdown()
+
+    p = Server(binary, [lo, hi])
+    check("lo first: NE from lo", [9999], p.post("[[120.75,23.75]]")[1])
+    check("lo first: NW from lo", [9999], p.post("[[120.25,23.75]]")[1])
+    p.shutdown()
+
+    # A single file argument still works, and mixes with directories.
+    p = Server(binary, [os.path.join(hi, "N23E120.hgt"), lo])
+    check("file arg then dir: NE from file", [2000], p.post("[[120.75,23.75]]")[1])
+    check("file arg then dir: NW from dir", [9999], p.post("[[120.25,23.75]]")[1])
+    p.shutdown()
+
+    # Within one directory the order is alphabetical, not readdir order.
+    both = tempfile.mkdtemp(prefix="demd-test-both-")
+    subprocess.check_call([sys.executable, os.path.join(HERE, "mktif.py"),
+                           "--value", "1111", os.path.join(both, "a.tif")])
+    subprocess.check_call([sys.executable, os.path.join(HERE, "mktif.py"),
+                           "--value", "2222", os.path.join(both, "b.tif")])
+    p = Server(binary, both)
+    check("same dir: a.tif before b.tif", [1111], p.post("[[120.957283,23.47]]")[1])
+    check_clean("no sanitizer findings (precedence)", p)
+    p.shutdown()
 
     print("== argument validation ==")
     # 0 legitimately means "unlimited", so anything that silently converts to

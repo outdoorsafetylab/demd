@@ -23,19 +23,33 @@ import sys
 
 N = 1201  # 3 arc-second tile
 NW, NE, SW, SE = 1000, 2000, 3000, 4000
+NODATA = -32768  # what the SRTMHGT driver reports as the no-data value
 
 
-def main(path):
+def main(path, fill=None, hole_nw=False):
     half = N // 2
-    north = struct.pack(">%dh" % N, *([NW] * half + [NE] * (N - half)))
-    south = struct.pack(">%dh" % N, *([SW] * half + [SE] * (N - half)))
+    if fill is not None:
+        row = struct.pack(">%dh" % N, *([fill] * N))
+        north = south = row
+    else:
+        nw = NODATA if hole_nw else NW
+        north = struct.pack(">%dh" % N, *([nw] * half + [NE] * (N - half)))
+        south = struct.pack(">%dh" % N, *([SW] * half + [SE] * (N - half)))
     with open(path, "wb") as f:
-        for row in range(N):
+        for row_index in range(N):
             # Row 0 is the northern edge.
-            f.write(north if row < half else south)
+            f.write(north if row_index < half else south)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("usage: mkdem.py <output.hgt>")
-    main(sys.argv[1])
+    args = sys.argv[1:]
+    hole_nw = "--hole-nw" in args
+    args = [a for a in args if a != "--hole-nw"]
+    fill = None
+    if "--fill" in args:
+        i = args.index("--fill")
+        fill = int(args[i + 1])
+        del args[i:i + 2]
+    if len(args) != 1:
+        sys.exit("usage: mkdem.py [--hole-nw] [--fill N] <output.hgt>")
+    main(args[0], fill, hole_nw)

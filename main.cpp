@@ -40,6 +40,8 @@ int main(int argc, char **argv) {
     struct event *term = NULL, *quit = NULL;
     int opt, ret = 0, port = defaultPort, verbose = 1;
     long maxPoints = defaultMaxPoints;
+    const char **paths = NULL;
+    size_t npaths = 0;
     const char *addr = defaultAddress;
     const char *srs = defaultSRS;
     const char *uri = defaultURI;
@@ -73,8 +75,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (optind >= argc || (argc-optind) > 1 || maxPoints < 0) {
-        fprintf(stdout, "Usage: %s [options] <DEM file or directory of DEM files>\n", argv[0]);
+    if (optind >= argc || maxPoints < 0) {
+        fprintf(stdout, "Usage: %s [options] <DEM file or directory>...\n", argv[0]);
         fprintf(stdout, "Options:\n");
         fprintf(stdout, "    -a <addr> : Address to bind HTTP (default: %s)\n", defaultAddress);
         fprintf(stdout, "    -p <port> : Port to bind HTTP (default: %d)\n", defaultPort);
@@ -83,6 +85,10 @@ int main(int argc, char **argv) {
         fprintf(stdout, "    -A <auth> : 'Authorization' header to control access, 401 status will be replied if not matched. (default: none)\n");
         fprintf(stdout, "    -m <max>  : Maximum number of points per request, 0 for unlimited (default: %ld)\n", defaultMaxPoints);
         fprintf(stdout, "    -q        : Do not log every lookup\n");
+        fprintf(stdout, "\n");
+        fprintf(stdout, "Paths are searched in the order given, and files within a directory in\n");
+        fprintf(stdout, "sorted order. The first dataset holding a value for a coordinate wins,\n");
+        fprintf(stdout, "so put higher-priority data first.\n");
         exit(1);
     }
 
@@ -90,9 +96,10 @@ int main(int argc, char **argv) {
     // progress in container logs until the process exits.
     setvbuf(stdout, NULL, _IOLBF, 0);
 
-    const char *path = argv[optind];
+    paths = (const char **) &argv[optind];
+    npaths = (size_t) (argc - optind);
     GDALAllRegister();
-    ctx = ContextCreate(path, srs, auth);
+    ctx = ContextCreate(paths, npaths, srs, auth);
     if (!ctx) {
         ret = 1;
         goto err;
@@ -101,7 +108,7 @@ int main(int argc, char **argv) {
     ContextSetVerbose(ctx, verbose);
 
     if (ContextEmpty(ctx)) {
-        fprintf(stderr, "No DEM found: %s\n", path);
+        fprintf(stderr, "No DEM found in %zu path(s), first is: %s\n", npaths, paths[0]);
         ret = 1;
         goto err;
     }
