@@ -24,11 +24,15 @@ Yes, you can just use `gdallocationinfo`. But every command of it forks a new pr
 
 # How to build
 
-This project was developed on Ubuntu 18.04 LTS. You will need to install the following packages by `apt-get` before building it:
+This project is built and tested on Ubuntu 24.04 LTS (GDAL 3.8, libevent 2.1, json-c 0.17). You will need to install the following packages by `apt-get` before building it:
 
 ```shell
-sudo apt-get install build-essential libgdal-dev libevent-dev libjson-c-dev
+sudo apt-get install build-essential pkg-config libgdal-dev libevent-dev libjson-c-dev
 ```
+
+GDAL 3 or newer and json-c 0.13 or newer are required. Include paths and link
+flags are resolved through `gdal-config` and `pkg-config`, so no distribution
+specific paths are hard-coded.
 
 To build:
 
@@ -39,21 +43,54 @@ make
 A executable file `demd` will be created. You can run it to see the help:
 
 ```shell
-Usage: ./demd [options] <DEM file or directory of DEM files>
+Usage: ./demd [options] <DEM file or directory>...
 Options:
     -a <addr> : Address to bind HTTP (default: 0.0.0.0)
     -p <port> : Port to bind HTTP (default: 80)
     -u <URI>  : URI to serve REST (default: /v1/elevations)
     -s <SRS>  : SRS of requested coordinates (default: WGS84)
     -A <auth> : 'Authorization' header to control access, 401 status will be replied if not matched. (default: none)
+    -m <max>  : Maximum number of points per request, 0 for unlimited (default: 100000)
+    -q        : Do not log every lookup
+
+Paths are searched in the order given, and files within a directory in
+sorted order. The first dataset holding a value for a coordinate wins,
+so put higher-priority data first.
 ```
+
+# Layering datasets
+
+Elevation data is rarely a single clean set: a new survey usually supersedes an
+older one over most of the area while dropping coverage somewhere the old one
+still has. Pass both, newest first:
+
+```shell
+./demd -p 8082 /var/lib/dem/current /var/lib/dem/fallback
+```
+
+Every coordinate is tried against each dataset in that order, and the first one
+holding a value answers. Where the current data has a hole, the fallback fills
+it; everywhere else the current data wins. Ordering is explicit rather than
+dependent on directory iteration, so the result does not change between hosts.
+
+# How to test
+
+The test suite synthesizes its own DEM tiles, so no data needs to be downloaded:
+
+```shell
+make test           # end-to-end tests against a normal build
+make test/sanitize  # the same tests under AddressSanitizer and UBSan
+```
+
+`make test/sanitize` is the one that matters for memory safety — `-Wall -Wextra`
+does not detect the class of bug the suite guards against. Both run in CI.
 
 # How to run
 
 If development packages was not installed, you may need the follow runtime dependency packages installed:
 
 ```shell
-sudo apt-get install libevent-2.1-6 libgdal20
+sudo apt-get install libgdal34t64 libevent-2.1-7t64 libjson-c5
 ```
 
 Or use `serve` target in `Makefile` to automatically download sample DEM files before starting the daemon:
@@ -61,14 +98,14 @@ Or use `serve` target in `Makefile` to automatically download sample DEM files b
 ```shell
 $ make serve
 ./demd -p 8082 dem
-Dataset loaded: dem/N21E120.hgt => (22.000417,119.999583,20.999583,121.000417)
-Dataset loaded: dem/N23E121.hgt => (24.000417,120.999583,22.999583,122.000417)
-Dataset loaded: dem/N20E121.hgt => (21.000417,120.999583,19.999583,122.000417)
-Dataset loaded: dem/N23E120.hgt => (24.000417,119.999583,22.999583,121.000417)
-Dataset loaded: dem/N20E122.hgt => (21.000417,121.999583,19.999583,123.000417)
-Dataset loaded: dem/N22E121.hgt => (23.000417,120.999583,21.999583,122.000417)
-Dataset loaded: dem/N22E120.hgt => (23.000417,119.999583,21.999583,121.000417)
-Dataset loaded: dem/N21E121.hgt => (22.000417,120.999583,20.999583,122.000417)
+Dataset 1 loaded: dem/N20E121.hgt => (21.000417,120.999583,19.999583,122.000417)
+Dataset 2 loaded: dem/N20E122.hgt => (21.000417,121.999583,19.999583,123.000417)
+Dataset 3 loaded: dem/N21E120.hgt => (22.000417,119.999583,20.999583,121.000417)
+Dataset 4 loaded: dem/N21E121.hgt => (22.000417,120.999583,20.999583,122.000417)
+Dataset 5 loaded: dem/N22E120.hgt => (23.000417,119.999583,21.999583,121.000417)
+Dataset 6 loaded: dem/N22E121.hgt => (23.000417,120.999583,21.999583,122.000417)
+Dataset 7 loaded: dem/N23E120.hgt => (24.000417,119.999583,22.999583,121.000417)
+Dataset 8 loaded: dem/N23E121.hgt => (24.000417,120.999583,22.999583,122.000417)
 Serving http://0.0.0.0:8082/v1/elevations
 ```
 
@@ -76,7 +113,7 @@ To query the elevation of Mt. Jade, highest peak of Taiwan:
 
 ```shell
 $ curl -XPOST --data '[[120.957283,23.47]]' http://127.0.0.1:8082/v1/elevations
-[ 3917 ]
+[ 3917.0 ]
 ```
 
 # API specification

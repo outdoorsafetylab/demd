@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgdal-dev libevent-dev libjson-c-dev
+
+      - name: Build
+        run: make CXXFLAGS="-O2 -g -Wall -Wextra -Werror"
+
+      - name: End-to-end tests
+        run: make test
+
+  sanitize:
+    name: Sanitizers
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgdal-dev libevent-dev libjson-c-dev
+
+      # The memory errors this suite exists to catch are invisible to
+      # -Wall -Wextra; only the sanitizers see them.
+      - name: Build and test with ASan/UBSan
+        run: make test/sanitize
+
+  stress:
+    name: Stress tool
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: stress
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          # No third-party dependencies, so there is no go.sum to key a cache on.
+          cache: false
+      - run: go vet ./...
+      - run: go test ./...
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg GIT_HASH="${GITHUB_SHA::7}" \
+            --build-arg GIT_TAG="${GITHUB_REF_NAME}" \
+            -t demd:ci .
+      - name: Smoke test the image
+        run: |
+          python3 test/mkdem.py /tmp/N23E120.hgt
+          docker run -d --name demd-ci -p 8080:8080 \
+            -v /tmp:/var/lib/dem:ro demd:ci
+          for i in $(seq 30); do
+            curl -sf -XPOST --data '[[120.25,23.75]]' \
+              http://127.0.0.1:8080/v1/elevations && break || sleep 1
+          done
+          # Compare numerically: json-c renders integral doubles as "1000.0".
+          curl -s -XPOST --data '[[120.25,23.75]]' \
+            http://127.0.0.1:8080/v1/elevations \
+            | python3 -c 'import json,sys; v=json.load(sys.stdin); assert v==[1000], v'
+          docker rm -f demd-ci

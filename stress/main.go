@@ -5,7 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
@@ -68,7 +68,7 @@ func main() {
 					errCh <- err
 					return
 				}
-				durationCh <- time.Now().Sub(t0)
+				durationCh <- time.Since(t0)
 				countCh <- n
 			}
 		}(c)
@@ -88,7 +88,7 @@ func main() {
 			break
 		}
 	}
-	dt := time.Now().Sub(t0)
+	dt := time.Since(t0)
 	log.Printf("Time elapsed: %v", dt)
 	log.Printf("Average RTT per request: %v", duration/time.Duration(clients*requestsPerClient))
 	log.Printf("Average throughput: %d elevations/sec", time.Second*time.Duration(total)/dt)
@@ -121,7 +121,7 @@ func (c *client) query(n int, close bool) error {
 		return err
 	}
 	defer res.Body.Close()
-	_, err = ioutil.ReadAll(res.Body)
+	_, err = io.ReadAll(res.Body)
 	if err != nil {
 		return err
 	}

@@ -1,0 +1,21 @@
+.git
+.github
+.vscode
+debian
+
+# Build output
+*.o
+*.d
+demd
+
+# DEM data: these are hundreds of megabytes and are mounted at runtime,
+# never baked into this image.
+dem/
+*.tif
+*.tfw
+*.hgt
+*.zip
+*.7z
+
+# Not needed to build or test the service.
+stress/
