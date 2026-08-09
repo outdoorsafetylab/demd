@@ -302,6 +302,11 @@ def main(binary):
     for bad in ("", "abc", "10x", " ", "-1", "99999999999999999999", "1e5"):
         code, _ = run_cli(binary, "-m", bad, demdir)
         check("-m %-24r rejected" % bad, True, code != 0)
+    # maxPoints * 64 + 4096 is computed as size_t; a value that overflows it
+    # would wrap to a tiny body cap instead of the huge one requested.
+    for huge in ("9223372036854775807", "300000000000000000"):
+        code, _ = run_cli(binary, "-m", huge, demdir)
+        check("-m %-24r rejected (overflow)" % huge, True, code != 0)
     for good in ("0", "1", "100000"):
         s2 = Server(binary, demdir, "-m", good)
         check("-m %-24r accepted" % good, True, s2.alive())
@@ -327,8 +332,7 @@ def main(binary):
           s.post("[[120.25,23.75]]", headers={"Authorization": "Bearer nope"})[0])
     check("correct credentials -> 200", 200,
           s.post("[[120.25,23.75]]", headers={"Authorization": AUTH})[0])
-    check_clean("no sanitizer findings (auth)", s)
-    check("clean exit on SIGINT", 0, s.shutdown(signal.SIGINT))
+    check_shutdown("auth (SIGINT)", s, signal.SIGINT)
 
     print()
     if failures:

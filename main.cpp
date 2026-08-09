@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <errno.h>
 #include <signal.h>
@@ -66,6 +67,13 @@ int main(int argc, char **argv) {
                 // and leaves nothing trailing to reject.
                 if (errno || !rest || rest == optarg || *rest || maxPoints < 0) {
                     fprintf(stderr, "Invalid -m value: %s\n", optarg);
+                    exit(1);
+                }
+                // The body cap is derived from this below; a value that
+                // overflows that arithmetic would wrap to a tiny limit rather
+                // than the enormous one asked for.
+                if ((size_t) maxPoints > (SIZE_MAX - 4096) / 64) {
+                    fprintf(stderr, "Too large -m value: %s\n", optarg);
                     exit(1);
                 }
                 break;
