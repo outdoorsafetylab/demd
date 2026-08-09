@@ -98,14 +98,14 @@ Or use `serve` target in `Makefile` to automatically download sample DEM files b
 ```shell
 $ make serve
 ./demd -p 8082 dem
-Dataset loaded: dem/N21E120.hgt => (22.000417,119.999583,20.999583,121.000417)
-Dataset loaded: dem/N23E121.hgt => (24.000417,120.999583,22.999583,122.000417)
-Dataset loaded: dem/N20E121.hgt => (21.000417,120.999583,19.999583,122.000417)
-Dataset loaded: dem/N23E120.hgt => (24.000417,119.999583,22.999583,121.000417)
-Dataset loaded: dem/N20E122.hgt => (21.000417,121.999583,19.999583,123.000417)
-Dataset loaded: dem/N22E121.hgt => (23.000417,120.999583,21.999583,122.000417)
-Dataset loaded: dem/N22E120.hgt => (23.000417,119.999583,21.999583,121.000417)
-Dataset loaded: dem/N21E121.hgt => (22.000417,120.999583,20.999583,122.000417)
+Dataset 1 loaded: dem/N20E121.hgt => (21.000417,120.999583,19.999583,122.000417)
+Dataset 2 loaded: dem/N20E122.hgt => (21.000417,121.999583,19.999583,123.000417)
+Dataset 3 loaded: dem/N21E120.hgt => (22.000417,119.999583,20.999583,121.000417)
+Dataset 4 loaded: dem/N21E121.hgt => (22.000417,120.999583,20.999583,122.000417)
+Dataset 5 loaded: dem/N22E120.hgt => (23.000417,119.999583,21.999583,121.000417)
+Dataset 6 loaded: dem/N22E121.hgt => (23.000417,120.999583,21.999583,122.000417)
+Dataset 7 loaded: dem/N23E120.hgt => (24.000417,119.999583,22.999583,121.000417)
+Dataset 8 loaded: dem/N23E121.hgt => (24.000417,120.999583,22.999583,122.000417)
 Serving http://0.0.0.0:8082/v1/elevations
 ```
 
@@ -113,7 +113,7 @@ To query the elevation of Mt. Jade, highest peak of Taiwan:
 
 ```shell
 $ curl -XPOST --data '[[120.957283,23.47]]' http://127.0.0.1:8082/v1/elevations
-[ 3917 ]
+[ 3917.0 ]
 ```
 
 # API specification

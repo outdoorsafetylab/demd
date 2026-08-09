@@ -248,7 +248,13 @@ def main(binary):
     s = Server(binary, demdir, "-m", "10")
     check("11 points -> 413", 413, s.post("[" + "[120.25,23.75]," * 10 + "[120.25,23.75]]")[0])
     check("10 points -> 200", 200, s.post("[" + "[120.25,23.75]," * 9 + "[120.25,23.75]]")[0])
-    check("oversized body -> rejected", True, s.post("[" + "[120.25,23.75]," * 50000 + "[1,2]]")[0] != 200)
+    # Ten points either way, so the point-count check cannot be what rejects
+    # these -- only the body-size cap can tell them apart. With -m 10 the cap
+    # is 10*64 + 4096 bytes.
+    ten = "[" + "[120.25,23.75]," * 9 + "[120.25,23.75]"
+    check("10 points, 3 KB body -> 200", 200, s.post(ten + " " * 3000 + "]")[0])
+    check("10 points, 8 KB body -> 413", 413, s.post(ten + " " * 8000 + "]")[0])
+    check("huge body -> rejected", True, s.post("[" + "[120.25,23.75]," * 50000 + "[1,2]]")[0] != 200)
     check("server survived oversized body", True, s.alive())
     check_shutdown("limits", s)
 
