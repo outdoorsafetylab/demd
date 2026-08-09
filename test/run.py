@@ -9,6 +9,7 @@ in the server's output.
 """
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -80,6 +81,13 @@ class Server:
 
     def alive(self):
         return self.proc.poll() is None
+
+    def bounds(self):
+        """(top, left, bottom, right) from the startup line, in the request SRS."""
+        m = re.search(r"Dataset loaded: \S+ => \(([-\d.,]+)\)", self.output())
+        if not m:
+            return None
+        return tuple(float(v) for v in m.group(1).split(","))
 
     def output(self):
         self.log.seek(0)
@@ -173,6 +181,35 @@ def main(binary):
     check("far outside -> null", [None], t.post("[[0.0,0.0]]")[1])
     check_clean("no sanitizer findings (projected)", t)
     t.shutdown()
+
+    print("== rotated geotransform ==")
+    # Corner projection is order-dependent only when the geotransform has
+    # nonzero shear terms; every north-up fixture above multiplies them by
+    # zero and cannot see a regression there. The raster is a 800km square
+    # rotated 30 degrees about the middle of the TM2 zone, so every Taiwan
+    # coordinate is inside it regardless of the rotation.
+    rotdir = tempfile.mkdtemp(prefix="demd-test-rot-")
+    subprocess.check_call([sys.executable, os.path.join(HERE, "mktif.py"),
+                           "--rotated", os.path.join(rotdir, "rotated.tif")])
+    r = Server(binary, rotdir)
+    # The dataset bounds are where the corner projection is actually
+    # observable. They only gate a fast path -- the per-pixel range check
+    # backstops every lookup -- so a corrupted envelope changes no HTTP
+    # response, it just silently widens the box. Deriving the northing from
+    # the already-projected easting put `left` in the Atlantic (-56.7) and
+    # `top` in Mongolia (48.9) while every query below still passed.
+    top, left, bottom, right = r.bounds() or (0, 0, 0, 0)
+    check("rotated: bounds left  115..117", True, 114.0 < left < 118.0)
+    check("rotated: bounds right 125..127", True, 124.0 < right < 128.0)
+    check("rotated: bounds bottom 18..20", True, 17.0 < bottom < 21.0)
+    check("rotated: bounds top   27..29", True, 27.0 < top < 30.0)
+    check("rotated: Mt. Jade", [5000], r.post("[[120.957283,23.47]]")[1])
+    check("rotated: Taipei", [5000], r.post("[[121.5,25.03]]")[1])
+    check("rotated: Kaohsiung", [5000], r.post("[[120.3,22.63]]")[1])
+    check("rotated: Hualien", [5000], r.post("[[121.6,23.99]]")[1])
+    check("rotated: far outside -> null", [None], r.post("[[0.0,0.0]]")[1])
+    check_clean("no sanitizer findings (rotated)", r)
+    r.shutdown()
 
     print("== protocol ==")
     check("GET -> 405", 405, s.post("[]", method="GET")[0])

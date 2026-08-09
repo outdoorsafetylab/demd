@@ -59,7 +59,7 @@ test: $(EXEC)
 test/sanitize:
 	$(MAKE) clean
 	$(MAKE) $(EXEC) CXXFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1"
-	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 python3 test/run.py ./$(EXEC)
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 python3 test/run.py ./$(EXEC)
 	$(MAKE) clean
 
 clean:

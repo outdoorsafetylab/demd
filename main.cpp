@@ -52,7 +52,19 @@ int main(int argc, char **argv) {
             case 'u': uri = optarg; break;
             case 's': srs = optarg; break;
             case 'A': auth = optarg; break;
-            case 'm': maxPoints = atol(optarg); break;
+            case 'm': {
+                // atol() cannot report failure, and its 0 on garbage would
+                // quietly mean "unlimited" -- i.e. a typo would disable both
+                // the point cap and the body-size cap.
+                char *rest = NULL;
+                errno = 0;
+                maxPoints = strtol(optarg, &rest, 10);
+                if (errno || !rest || *rest || maxPoints < 0) {
+                    fprintf(stderr, "Invalid -m value: %s\n", optarg);
+                    exit(1);
+                }
+                break;
+            }
             case 'q': verbose = 0; break;
             default : fprintf(stderr, "Unknown option %c\n", opt); break;
         }
@@ -70,6 +82,10 @@ int main(int argc, char **argv) {
         fprintf(stdout, "    -q        : Do not log every lookup\n");
         exit(1);
     }
+
+    // stdout is fully buffered when it is not a tty, which hides the startup
+    // progress in container logs until the process exits.
+    setvbuf(stdout, NULL, _IOLBF, 0);
 
     const char *path = argv[optind];
     GDALAllRegister();

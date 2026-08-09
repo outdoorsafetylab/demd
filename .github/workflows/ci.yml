@@ -79,6 +79,8 @@ jobs:
             curl -sf -XPOST --data '[[120.25,23.75]]' \
               http://127.0.0.1:8080/v1/elevations && break || sleep 1
           done
-          test "$(curl -s -XPOST --data '[[120.25,23.75]]' \
-            http://127.0.0.1:8080/v1/elevations | tr -d ' []')" = "1000"
+          # Compare numerically: json-c renders integral doubles as "1000.0".
+          curl -s -XPOST --data '[[120.25,23.75]]' \
+            http://127.0.0.1:8080/v1/elevations \
+            | python3 -c 'import json,sys; v=json.load(sys.stdin); assert v==[1000], v'
           docker rm -f demd-ci
