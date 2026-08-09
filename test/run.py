@@ -103,6 +103,24 @@ class Server:
             return "timeout"
 
 
+def run_cli(binary, *args):
+    """Run to completion and return (exit code, combined output)."""
+    p = subprocess.run([binary, *args], stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=60)
+    return p.returncode, p.stdout.decode(errors="replace")
+
+
+def check_no_sanitizer(name, output):
+    for marker in ("AddressSanitizer", "LeakSanitizer", "runtime error:",
+                   "detected memory leaks"):
+        if marker in output:
+            print("  FAIL  %-46s sanitizer output:" % name)
+            print("\n".join("        " + l for l in output.splitlines()[-25:]))
+            failures.append(name)
+            return
+    check(name, True, True)
+
+
 def check_clean(name, server):
     """Sanitizer reports go to the server's stderr, not to any response."""
     out = server.output()
@@ -226,6 +244,30 @@ def main(binary):
     check("server survived oversized body", True, s.alive())
     check_clean("no sanitizer findings (limits)", s)
     s.shutdown()
+
+    print("== argument validation ==")
+    # 0 legitimately means "unlimited", so anything that silently converts to
+    # 0 disables both the point cap and the body-size cap.
+    for bad in ("", "abc", "10x", " ", "-1", "99999999999999999999", "1e5"):
+        code, _ = run_cli(binary, "-m", bad, demdir)
+        check("-m %-24r rejected" % bad, True, code != 0)
+    for good in ("0", "1", "100000"):
+        s2 = Server(binary, demdir, "-m", good)
+        check("-m %-24r accepted" % good, True, s2.alive())
+        s2.shutdown()
+
+    print("== invalid SRS (the path that used to leak) ==")
+    # sanitizeSRS() returned early on OSRSetFromUserInput() failure without
+    # destroying its spatial reference. Nothing else in the suite reaches it.
+    code, out = run_cli(binary, "-s", "not-a-spatial-reference", demdir)
+    check("invalid -s exits nonzero", True, code != 0)
+    check_no_sanitizer("invalid -s leaves no leak", out)
+    code, out = run_cli(binary, "-s", "EPSG:999999", demdir)
+    check("unknown EPSG exits nonzero", True, code != 0)
+    check_no_sanitizer("unknown EPSG leaves no leak", out)
+    code, out = run_cli(binary, "/nonexistent-dem-path")
+    check("missing DEM path exits nonzero", True, code != 0)
+    check_no_sanitizer("missing DEM path leaves no leak", out)
 
     print("== auth ==")
     s = Server(binary, demdir, "-A", AUTH)

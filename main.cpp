@@ -59,7 +59,10 @@ int main(int argc, char **argv) {
                 char *rest = NULL;
                 errno = 0;
                 maxPoints = strtol(optarg, &rest, 10);
-                if (errno || !rest || *rest || maxPoints < 0) {
+                // rest == optarg means no digits were consumed at all, which
+                // is how an empty argument slips through: it converts to 0
+                // and leaves nothing trailing to reject.
+                if (errno || !rest || rest == optarg || *rest || maxPoints < 0) {
                     fprintf(stderr, "Invalid -m value: %s\n", optarg);
                     exit(1);
                 }
