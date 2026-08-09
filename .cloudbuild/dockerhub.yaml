@@ -31,6 +31,11 @@ steps:
   args:
   - push
   - outdoorsafetylab/demd:$TAG_NAME
+# The image is built from source on Ubuntu 24.04: two apt stages pulling
+# libgdal-dev, plus the end-to-end suite running in the builder. That is
+# comfortably past Cloud Build's 10 minute default on a stock worker.
+timeout: 2400s
+
 availableSecrets:
    secretManager:
    - versionName: projects/outdoorsafetylab/secrets/dockerhub_username/versions/latest
