@@ -13,7 +13,12 @@ carrying a real rotation, which is the only way to give the geotransform
 nonzero shear terms. Corner projection is order-dependent only when those
 terms are nonzero, so a north-up fixture cannot detect a regression there.
 
-    usage: mktif.py [--rotated] <output.tif>
+--shift moves the tile north or south by a whole number of metres, which is
+how a fixture builds several tiles that do not overlap. Coverage that overlaps
+cannot show whether a lookup opened one file or three: the first dataset in
+precedence order answers and the rest are never touched.
+
+    usage: mktif.py [--rotated] [--value N] [--shift METRES] <output.tif>
 """
 import math
 import struct
@@ -39,8 +44,9 @@ SHORT, LONG, DOUBLE = 3, 4, 12
 MODEL_PIXEL_SCALE, MODEL_TRANSFORMATION, MODEL_TIEPOINT = 33550, 34264, 33922
 
 
-def main(path, rotated=False, value=VALUE):
+def main(path, rotated=False, value=VALUE, shift=0.0):
     width, height = (ROT_SIZE, ROT_SIZE) if rotated else (WIDTH, HEIGHT)
+    origin_y = ORIGIN_Y + shift
     pixels = width * height
     data = struct.pack("<%dh" % pixels, *([value] * pixels))
 
@@ -49,7 +55,7 @@ def main(path, rotated=False, value=VALUE):
         a, b = PIXEL * math.cos(t), PIXEL * math.sin(t)
         c, d = PIXEL * math.sin(t), -PIXEL * math.cos(t)
         x0 = ROT_CENTER_X - a * width / 2 - b * height / 2
-        y0 = ROT_CENTER_Y - c * width / 2 - d * height / 2
+        y0 = ROT_CENTER_Y + shift - c * width / 2 - d * height / 2
         # 4x4 affine, row-major, as GeoTIFF defines tag 34264.
         geo_tag = MODEL_TRANSFORMATION
         geo_blob = struct.pack(
@@ -63,7 +69,7 @@ def main(path, rotated=False, value=VALUE):
         geo_tag = MODEL_PIXEL_SCALE
         geo_blob = struct.pack("<3d", PIXEL, PIXEL, 0.0)
 
-    tiepoint = struct.pack("<6d", 0.0, 0.0, 0.0, ORIGIN_X, ORIGIN_Y, 0.0)
+    tiepoint = struct.pack("<6d", 0.0, 0.0, 0.0, ORIGIN_X, origin_y, 0.0)
     # GeoKeyDirectory: version 1.1.0, 3 keys.
     geokeys = struct.pack(
         "<16H",
@@ -133,6 +139,11 @@ if __name__ == "__main__":
         i = args.index("--value")
         value = int(args[i + 1])
         del args[i:i + 2]
+    shift = 0.0
+    if "--shift" in args:
+        i = args.index("--shift")
+        shift = float(args[i + 1])
+        del args[i:i + 2]
     if len(args) != 1:
-        sys.exit("usage: mktif.py [--rotated] [--value N] <output.tif>")
-    main(args[0], rotated, value)
+        sys.exit("usage: mktif.py [--rotated] [--value N] [--shift METRES] <output.tif>")
+    main(args[0], rotated, value, shift)

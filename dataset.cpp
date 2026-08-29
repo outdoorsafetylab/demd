@@ -3,120 +3,96 @@
 #include <string.h>
 #include <errno.h>
 #include <math.h>
+#include <time.h>
 
 #include <gdal.h>
 #include <cpl_conv.h>
 #include <cpl_string.h>
 #include <ogr_srs_api.h>
 
+#include "srs.h"
 #include "dataset.h"
 
-static char *sanitizeSRS(const char *);
-static int datasetGetBounds(dataset *ctx);
-static int datasetGetCorner(dataset *, double *, double *);
-static void useTraditionalAxisOrder(OGRSpatialReferenceH);
+static struct dataset *datasetAlloc(const char *filename, OGRSpatialReferenceH hReqSRS);
+static int datasetLoad(struct dataset *, char *err, size_t errlen);
+static int datasetLoadQuietly(struct dataset *, char *err, size_t errlen);
+static int datasetComputeBounds(struct dataset *);
+static int datasetGetCorner(struct dataset *, double *, double *);
+
+// A file that will not open is not written off for good. These datasets may
+// live in cloud storage, where 429/503/timeout and a credential that is a few
+// seconds from being refreshed are ordinary and temporary; GDAL's own HTTP
+// retry is off by default, so one blip arrives here as a hard failure. Writing
+// that off permanently would turn a network hiccup into a tile that answers
+// null for the rest of the process's life -- indistinguishable, to a caller,
+// from ground nobody has data for.
+//
+// So: back off instead of giving up. A transient failure heals within the
+// ceiling; a genuinely broken file costs one probe every few minutes.
+//
+// No attempt is made to sort failures into retryable and permanent.
+// CPLGetLastErrorNo() is not consistent across drivers and /vsi handlers, and
+// the price of getting that classification wrong is exactly the permanent
+// wrong answer this exists to prevent.
+#define DATASET_RETRY_CEILING 300
 
 struct dataset {
     char *filename;
+    // Borrowed. The context owns the request SRS and outlives every dataset,
+    // which is what keeps one WKT string and one OGRSpatialReference in the
+    // process rather than one per tile.
+    OGRSpatialReferenceH hReqSRS;
+
+    // Everything below hSrcDS is derived from the open file and is released
+    // together with it by DatasetClose().
     GDALDatasetH hSrcDS;
     GDALRasterBandH hBand;
     double NoDataValue;
-    OGRSpatialReferenceH hSrcSRS;
-    OGRSpatialReferenceH hTrgSRS;
-    char *SanitizedSRS;
-    OGRCoordinateTransformationH hCT;
-    OGRCoordinateTransformationH hInvCT;
+    OGRSpatialReferenceH hFileSRS;
+    OGRCoordinateTransformationH hCT;     // request SRS -> the file's
+    OGRCoordinateTransformationH hInvCT;  // the file's -> request SRS
     double adfGeoTransform[6];
     double adfInvGeoTransform[6];
+
+    // In the request SRS, not the file's. See datasetComputeBounds().
     double top;
     double left;
     double bottom;
     double right;
+
+    int fail_count;
+    time_t next_retry;
 };
 
-dataset *DatasetCreate(const char *filename, const char *srs) {
-    dataset *ctx = (dataset *) calloc(1, sizeof(dataset));
+struct dataset *DatasetCreate(const char *filename, OGRSpatialReferenceH hReqSRS) {
+    struct dataset *ctx = datasetAlloc(filename, hReqSRS);
     if (!ctx) {
-        fprintf(stderr, "Failed to allocate dataset: %s\n", strerror(errno));
         return NULL;
     }
-    ctx->hSrcDS = GDALOpen(filename, GA_ReadOnly);
-    if (!ctx->hSrcDS) {
-        fprintf(stderr, "Failed to open '%s': %s\n", filename, CPLGetLastErrorMsg());
+    char err[512];
+    if (!datasetLoad(ctx, err, sizeof(err))) {
+        fprintf(stderr, "%s\n", err);
         DatasetFree(ctx);
         return NULL;
     }
-    ctx->filename = strdup(filename);
-    if (!ctx->filename) {
-        fprintf(stderr, "Failed to copy filename: %s\n", strerror(errno));
+    if (!datasetComputeBounds(ctx)) {
+        fprintf(stderr, "Failed to get bounds '%s': %s\n", filename, CPLGetLastErrorMsg());
         DatasetFree(ctx);
         return NULL;
     }
-    int count = GDALGetRasterCount(ctx->hSrcDS);
-    if (count != 1) {
-        fprintf(stderr, "Unexpected number of band '%s': %d\n", filename, count);
-        DatasetFree(ctx);
+    return ctx;
+}
+
+struct dataset *DatasetCreateIndexed(const char *filename, OGRSpatialReferenceH hReqSRS,
+        double top, double left, double bottom, double right) {
+    struct dataset *ctx = datasetAlloc(filename, hReqSRS);
+    if (!ctx) {
         return NULL;
     }
-    ctx->hBand = GDALGetRasterBand(ctx->hSrcDS, 1);
-    if (!ctx->hBand) {
-        fprintf(stderr, "Failed to get raster band '%s': %s\n", filename, CPLGetLastErrorMsg());
-        DatasetFree(ctx);
-        return NULL;
-    }
-    if (GDALDataTypeIsComplex(GDALGetRasterDataType(ctx->hBand))) {
-        fprintf(stderr, "Unexpected data type '%s'\n", filename);
-        DatasetFree(ctx);
-        return NULL;
-    }
-    ctx->NoDataValue = GDALGetRasterNoDataValue(ctx->hBand, NULL);
-    if (GDALGetGeoTransform(ctx->hSrcDS, ctx->adfGeoTransform) != CE_None) {
-        fprintf(stderr, "Failed to get geotransform %s: %s\n", filename, CPLGetLastErrorMsg());
-        DatasetFree(ctx);
-        return NULL;
-    }
-    if (!GDALInvGeoTransform(ctx->adfGeoTransform, ctx->adfInvGeoTransform)) {
-        fprintf(stderr, "Failed to invert geotransform %s: %s\n", filename, CPLGetLastErrorMsg());
-        DatasetFree(ctx);
-        return NULL;
-    }
-    ctx->SanitizedSRS = sanitizeSRS(srs);
-    if (!ctx->SanitizedSRS) {
-        fprintf(stderr, "Failed to sanitize SRS '%s': %s\n", srs, CPLGetLastErrorMsg());
-        DatasetFree(ctx);
-        return NULL;
-    }
-    ctx->hSrcSRS = OSRNewSpatialReference(ctx->SanitizedSRS);
-    if (!ctx->hSrcSRS) {
-        fprintf(stderr, "Failed to create source SRS: %s\n", CPLGetLastErrorMsg());
-        DatasetFree(ctx);
-        return NULL;
-    }
-    useTraditionalAxisOrder(ctx->hSrcSRS);
-    ctx->hTrgSRS = OSRNewSpatialReference(GDALGetProjectionRef(ctx->hSrcDS));
-    if (!ctx->hTrgSRS) {
-        fprintf(stderr, "Failed to create target SRS: %s\n", CPLGetLastErrorMsg());
-        DatasetFree(ctx);
-        return NULL;
-    }
-    useTraditionalAxisOrder(ctx->hTrgSRS);
-    ctx->hCT = OCTNewCoordinateTransformation(ctx->hSrcSRS, ctx->hTrgSRS);
-    if (!ctx->hCT) {
-        fprintf(stderr, "Failed to create coordinate transform: %s\n", CPLGetLastErrorMsg());
-        DatasetFree(ctx);
-        return NULL;
-    }
-    ctx->hInvCT = OCTNewCoordinateTransformation(ctx->hTrgSRS, ctx->hSrcSRS);
-    if (!ctx->hInvCT) {
-        fprintf(stderr, "Failed to inverse coordinate transform: %s\n", CPLGetLastErrorMsg());
-        DatasetFree(ctx);
-        return NULL;
-    }
-    if (!datasetGetBounds(ctx)) {
-        fprintf(stderr, "Failed to get bounds: %s\n", CPLGetLastErrorMsg());
-        DatasetFree(ctx);
-        return NULL;
-    }
+    ctx->top = top;
+    ctx->left = left;
+    ctx->bottom = bottom;
+    ctx->right = right;
     return ctx;
 }
 
@@ -124,37 +100,83 @@ void DatasetFree(struct dataset *ctx) {
     if (!ctx) {
         return;
     }
+    DatasetClose(ctx);
     if (ctx->filename) {
         free(ctx->filename);
     }
+    free(ctx);
+}
+
+void DatasetClose(struct dataset *ctx) {
     if (ctx->hCT) {
         OCTDestroyCoordinateTransformation(ctx->hCT);
+        ctx->hCT = NULL;
     }
     if (ctx->hInvCT) {
         OCTDestroyCoordinateTransformation(ctx->hInvCT);
+        ctx->hInvCT = NULL;
     }
-    if (ctx->SanitizedSRS) {
-        // Allocated by OSRExportToWkt(), so it belongs to CPL's allocator.
-        CPLFree(ctx->SanitizedSRS);
-    }
-    if (ctx->hTrgSRS) {
-        OSRDestroySpatialReference(ctx->hTrgSRS);
-    }
-    if (ctx->hSrcSRS) {
-        OSRDestroySpatialReference(ctx->hSrcSRS);
+    if (ctx->hFileSRS) {
+        OSRDestroySpatialReference(ctx->hFileSRS);
+        ctx->hFileSRS = NULL;
     }
     if (ctx->hSrcDS) {
         GDALClose(ctx->hSrcDS);
+        ctx->hSrcDS = NULL;
     }
-    free(ctx);
+    ctx->hBand = NULL;
+}
+
+int DatasetIsOpen(struct dataset *ctx) {
+    return ctx->hSrcDS != NULL;
+}
+
+int DatasetOpen(struct dataset *ctx) {
+    if (ctx->hSrcDS) {
+        return TRUE;
+    }
+    time_t now = time(NULL);
+    if (ctx->fail_count > 0 && now < ctx->next_retry) {
+        return FALSE;
+    }
+    char err[512];
+    if (datasetLoad(ctx, err, sizeof(err))) {
+        ctx->fail_count = 0;
+        ctx->next_retry = 0;
+        return TRUE;
+    }
+    // A half-built dataset must not be left behind: the next attempt starts
+    // from GDALOpen() and would leak whatever this one already allocated.
+    DatasetClose(ctx);
+    ctx->fail_count++;
+    long wait = ctx->fail_count >= 31 ? DATASET_RETRY_CEILING : (1L << ctx->fail_count);
+    if (wait > DATASET_RETRY_CEILING) {
+        wait = DATASET_RETRY_CEILING;
+    }
+    ctx->next_retry = now + wait;
+    // Log on powers of two. A tile that is broken for good would otherwise
+    // print on every lookup that reaches it, and one that is silent entirely
+    // is worse still -- the null it returns cannot be told apart from "not
+    // covered" by anyone reading the response.
+    if ((ctx->fail_count & (ctx->fail_count - 1)) == 0) {
+        fprintf(stderr, "%s (attempt %d, next try in %lds)\n", err, ctx->fail_count, wait);
+    }
+    return FALSE;
 }
 
 const char *DatasetFilename(struct dataset *ctx) {
     return ctx->filename;
 }
 
+int DatasetContains(struct dataset *ctx, double x, double y) {
+    return !(x < ctx->left || x > ctx->right || y < ctx->bottom || y > ctx->top);
+}
+
 double DatasetGetAltitude(struct dataset *ctx, double dfGeoX, double dfGeoY) {
-    if (dfGeoX < ctx->left || dfGeoX > ctx->right || dfGeoY < ctx->bottom || dfGeoY > ctx->top) {
+    if (!DatasetContains(ctx, dfGeoX, dfGeoY)) {
+        return NAN;
+    }
+    if (!ctx->hSrcDS) {
         return NAN;
     }
     if (!OCTTransform(ctx->hCT, 1, &dfGeoX, &dfGeoY, NULL)) {
@@ -194,7 +216,96 @@ void DatasetGetBounds(struct dataset *ctx, double *t, double *l, double *b, doub
     *r = ctx->right;
 }
 
-int datasetGetBounds(struct dataset *ctx) {
+struct dataset *datasetAlloc(const char *filename, OGRSpatialReferenceH hReqSRS) {
+    struct dataset *ctx = (struct dataset *) calloc(1, sizeof(struct dataset));
+    if (!ctx) {
+        fprintf(stderr, "Failed to allocate dataset: %s\n", strerror(errno));
+        return NULL;
+    }
+    ctx->filename = strdup(filename);
+    if (!ctx->filename) {
+        fprintf(stderr, "Failed to copy filename: %s\n", strerror(errno));
+        free(ctx);
+        return NULL;
+    }
+    ctx->hReqSRS = hReqSRS;
+    return ctx;
+}
+
+// Opens the file and builds everything derived from it. Reports why it failed
+// through `err` rather than printing: the caller decides whether this is a
+// startup error worth showing or one more backed-off retry to keep quiet.
+//
+// GDAL's default handler prints to stderr itself, which would defeat that --
+// DatasetOpen()'s rate limiting can only govern the lines it writes. Silencing
+// GDAL here does not lose anything: the message is still retrievable through
+// CPLGetLastErrorMsg(), and it goes into `err`.
+int datasetLoad(struct dataset *ctx, char *err, size_t errlen) {
+    CPLPushErrorHandler(CPLQuietErrorHandler);
+    int ok = datasetLoadQuietly(ctx, err, errlen);
+    CPLPopErrorHandler();
+    return ok;
+}
+
+int datasetLoadQuietly(struct dataset *ctx, char *err, size_t errlen) {
+    CPLErrorReset();
+    ctx->hSrcDS = GDALOpen(ctx->filename, GA_ReadOnly);
+    if (!ctx->hSrcDS) {
+        snprintf(err, errlen, "Failed to open '%s': %s", ctx->filename, CPLGetLastErrorMsg());
+        return FALSE;
+    }
+    int count = GDALGetRasterCount(ctx->hSrcDS);
+    if (count != 1) {
+        snprintf(err, errlen, "Unexpected number of band '%s': %d", ctx->filename, count);
+        return FALSE;
+    }
+    ctx->hBand = GDALGetRasterBand(ctx->hSrcDS, 1);
+    if (!ctx->hBand) {
+        snprintf(err, errlen, "Failed to get raster band '%s': %s",
+            ctx->filename, CPLGetLastErrorMsg());
+        return FALSE;
+    }
+    if (GDALDataTypeIsComplex(GDALGetRasterDataType(ctx->hBand))) {
+        snprintf(err, errlen, "Unexpected data type '%s'", ctx->filename);
+        return FALSE;
+    }
+    ctx->NoDataValue = GDALGetRasterNoDataValue(ctx->hBand, NULL);
+    if (GDALGetGeoTransform(ctx->hSrcDS, ctx->adfGeoTransform) != CE_None) {
+        snprintf(err, errlen, "Failed to get geotransform '%s': %s",
+            ctx->filename, CPLGetLastErrorMsg());
+        return FALSE;
+    }
+    if (!GDALInvGeoTransform(ctx->adfGeoTransform, ctx->adfInvGeoTransform)) {
+        snprintf(err, errlen, "Failed to invert geotransform '%s': %s",
+            ctx->filename, CPLGetLastErrorMsg());
+        return FALSE;
+    }
+    ctx->hFileSRS = OSRNewSpatialReference(GDALGetProjectionRef(ctx->hSrcDS));
+    if (!ctx->hFileSRS) {
+        snprintf(err, errlen, "Failed to create SRS of '%s': %s",
+            ctx->filename, CPLGetLastErrorMsg());
+        return FALSE;
+    }
+    SRSUseTraditionalAxisOrder(ctx->hFileSRS);
+    ctx->hCT = OCTNewCoordinateTransformation(ctx->hReqSRS, ctx->hFileSRS);
+    if (!ctx->hCT) {
+        snprintf(err, errlen, "Failed to create coordinate transform for '%s': %s",
+            ctx->filename, CPLGetLastErrorMsg());
+        return FALSE;
+    }
+    ctx->hInvCT = OCTNewCoordinateTransformation(ctx->hFileSRS, ctx->hReqSRS);
+    if (!ctx->hInvCT) {
+        snprintf(err, errlen, "Failed to inverse coordinate transform for '%s': %s",
+            ctx->filename, CPLGetLastErrorMsg());
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// The envelope is expressed in the *request* SRS, not the file's: every corner
+// goes through hInvCT on the way out. That is why an index records the SRS it
+// was built with -- the numbers in it are only meaningful for that one.
+int datasetComputeBounds(struct dataset *ctx) {
     double upperLeftX = 0, upperLeftY = 0;
     if (!datasetGetCorner(ctx, &upperLeftX, &upperLeftY)) {
         return FALSE;
@@ -229,32 +340,4 @@ int datasetGetCorner(struct dataset *ctx, double *x, double *y) {
         + ctx->adfGeoTransform[5] * line;
     double z = 0;
     return OCTTransform(ctx->hInvCT, 1, x, y, &z);
-}
-
-// GDAL 3 honours the authority-defined axis order, which makes EPSG:4326
-// latitude-first. Every coordinate in this service (and in GDAL's own
-// geotransforms) is longitude-first, so pin the traditional order.
-void useTraditionalAxisOrder(OGRSpatialReferenceH hSRS) {
-#if GDAL_VERSION_MAJOR >= 3
-    OSRSetAxisMappingStrategy(hSRS, OAMS_TRADITIONAL_GIS_ORDER);
-#else
-    (void) hSRS;
-#endif
-}
-
-char *sanitizeSRS(const char *pszUserInput) {
-    OGRSpatialReferenceH hSRS;
-    char *pszResult = NULL;
-
-    CPLErrorReset();
-
-    hSRS = OSRNewSpatialReference(NULL);
-    if (!hSRS) {
-        return NULL;
-    }
-    if (OSRSetFromUserInput(hSRS, pszUserInput) == OGRERR_NONE) {
-        OSRExportToWkt(hSRS, &pszResult);
-    }
-    OSRDestroySpatialReference(hSRS);
-    return pszResult;
 }

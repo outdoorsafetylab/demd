@@ -105,11 +105,65 @@ class Server:
             return "timeout"
 
 
-def run_cli(binary, *args):
+def run_cli(binary, *args, stdin=None):
     """Run to completion and return (exit code, combined output)."""
     p = subprocess.run([binary, *args], stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, timeout=60)
+                       stderr=subprocess.STDOUT, timeout=120,
+                       input=stdin.encode() if stdin is not None else None)
     return p.returncode, p.stdout.decode(errors="replace")
+
+
+def mkdem(path, *args):
+    subprocess.check_call([sys.executable, os.path.join(HERE, "mkdem.py"), *args, path])
+
+
+def mktif(path, *args):
+    subprocess.check_call([sys.executable, os.path.join(HERE, "mktif.py"), *args, path])
+
+
+def read_index(path):
+    """Splits an index into its header lines and its entry rows."""
+    head, rows = [], []
+    with open(path, encoding="utf-8") as f:
+        for line in f.read().splitlines():
+            (head if line.startswith("#") else rows).append(line)
+    return head, rows
+
+
+def write_index(path, head, rows):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(head + rows) + "\n")
+
+
+def index_of(dirpath):
+    return os.path.join(dirpath, "demd.index")
+
+
+def open_dem_files(pid):
+    """The DEM files the process holds open, or None where neither /proc nor
+    lsof can say. Linux and macOS answer differently and CI only runs one of
+    them; going through both keeps this from being a check that first executes
+    somewhere nobody is watching."""
+    procfd = "/proc/%d/fd" % pid
+    if os.path.isdir(procfd):
+        held = []
+        for name in os.listdir(procfd):
+            try:
+                held.append(os.readlink(os.path.join(procfd, name)))
+            except OSError:
+                pass  # the descriptor closed while we were looking
+        return [p for p in held if p.endswith((".tif", ".hgt"))]
+    try:
+        p = subprocess.run(["lsof", "-p", str(pid)], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    held = []
+    for line in p.stdout.decode(errors="replace").splitlines():
+        parts = line.split()
+        if parts and parts[-1].endswith((".tif", ".hgt")):
+            held.append(parts[-1])
+    return held
 
 
 def check_no_sanitizer(name, output):
@@ -333,6 +387,315 @@ def main(binary):
     check("correct credentials -> 200", 200,
           s.post("[[120.25,23.75]]", headers={"Authorization": AUTH})[0])
     check_shutdown("auth (SIGINT)", s, signal.SIGINT)
+
+
+    print("== index: a directory with an index answers identically ==")
+    # Whatever else changes, the answers must not. These are the georeferencing
+    # checks from the top of the suite, re-run against an indexed copy.
+    idxdir = tempfile.mkdtemp(prefix="demd-test-index-")
+    mkdem(os.path.join(idxdir, "N23E120.hgt"))
+    code, out = run_cli(binary, "-w", index_of(idxdir), idxdir)
+    check("index written", 0, code)
+    s = Server(binary, idxdir)
+    check("indexed NW  [120.25, 23.75]", [1000], s.post("[[120.25,23.75]]")[1])
+    check("indexed NE  [120.75, 23.75]", [2000], s.post("[[120.75,23.75]]")[1])
+    check("indexed SW  [120.25, 23.25]", [3000], s.post("[[120.25,23.25]]")[1])
+    check("indexed SE  [120.75, 23.25]", [4000], s.post("[[120.75,23.25]]")[1])
+    check("indexed outside coverage -> null", [None], s.post("[[125.0,30.0]]")[1])
+    check("indexed swapped axes -> null", [None], s.post("[[23.75,120.25]]")[1])
+    # The per-dataset line reports a successful open. With an index there is
+    # none to report at startup, and printing one per entry would be tens of
+    # thousands of lines besides.
+    check("startup reports the index, not each dataset", False,
+          "Dataset 1 loaded" in s.output())
+    check("startup names the index", True, "Index " in s.output())
+    check_shutdown("indexed directory", s)
+
+    # An index handed over directly is still an index, whatever it is called:
+    # recognition is by content, so `-w` may write anywhere.
+    named = os.path.join(tempfile.mkdtemp(prefix="demd-test-named-"), "world.idx")
+    code, out = run_cli(binary, "-w", named, idxdir)
+    check("index written under any name", 0, code)
+    s = Server(binary, named)
+    check("index passed as a file argument", [1000], s.post("[[120.25,23.75]]")[1])
+    check_shutdown("named index", s)
+
+    print("== index: its bounds are what gate lookups ==")
+    # Narrow one entry to the eastern half. Bounds only gate a fast path, so a
+    # server that re-derived them from the file -- i.e. opened it at startup --
+    # would answer for the west anyway and pass every other check here.
+    narrowdir = tempfile.mkdtemp(prefix="demd-test-narrow-")
+    mkdem(os.path.join(narrowdir, "N23E120.hgt"))
+    run_cli(binary, "-w", index_of(narrowdir), narrowdir)
+    head, rows = read_index(index_of(narrowdir))
+    fields = rows[0].split("\t")
+    fields[1] = "120.5"
+    write_index(index_of(narrowdir), head, ["\t".join(fields)])
+    s = Server(binary, narrowdir)
+    check("west of the narrowed bounds -> null", [None], s.post("[[120.25,23.75]]")[1])
+    check("east of them still answers", [2000], s.post("[[120.75,23.75]]")[1])
+    check_shutdown("narrowed bounds", s)
+
+    print("== index: order is precedence ==")
+    # Two datasets over identical ground. Which one answers is decided by their
+    # order in the index and by nothing else -- swapping two lines changes the
+    # number returned while leaving the path set, the count and every bbox
+    # untouched.
+    orderdir = tempfile.mkdtemp(prefix="demd-test-order-")
+    mktif(os.path.join(orderdir, "a.tif"), "--value", "1111")
+    mktif(os.path.join(orderdir, "b.tif"), "--value", "2222")
+    run_cli(binary, "-w", index_of(orderdir), orderdir)
+    head, rows = read_index(index_of(orderdir))
+    check("index holds both datasets", 2, len(rows))
+    s = Server(binary, orderdir)
+    check("index order: a.tif answers", [1111], s.post("[[120.957283,23.47]]")[1])
+    check_shutdown("index order", s)
+    write_index(index_of(orderdir), head, [rows[1], rows[0]])
+    s = Server(binary, orderdir)
+    check("swapped index: b.tif answers", [2222], s.post("[[120.957283,23.47]]")[1])
+    check_shutdown("swapped index order", s)
+
+    print("== index: NoData falls through in index order ==")
+    # The shape the production datasets actually have: two rasters over the
+    # same ground, the first with holes the second still covers.
+    # Both files describe the same tile, and the SRTMHGT driver takes
+    # georeferencing from the filename -- so they share a name and live in
+    # separate directories, exactly as the unindexed precedence test does.
+    holehi = tempfile.mkdtemp(prefix="demd-test-hole-hi-")
+    holelo = tempfile.mkdtemp(prefix="demd-test-hole-lo-")
+    mkdem(os.path.join(holehi, "N23E120.hgt"), "--hole-nw")
+    mkdem(os.path.join(holelo, "N23E120.hgt"), "--fill", "9999")
+    scanned = Server(binary, [holehi, holelo])
+    scan_ne = scanned.post("[[120.75,23.75]]")[1]
+    scan_nw = scanned.post("[[120.25,23.75]]")[1]
+    check_shutdown("fallthrough without an index", scanned)
+    hole_index = os.path.join(tempfile.mkdtemp(prefix="demd-test-hole-idx-"), "demd.index")
+    code, out = run_cli(binary, "-w", hole_index,
+                        os.path.join(holehi, "N23E120.hgt"),
+                        os.path.join(holelo, "N23E120.hgt"))
+    check("index written for the layered pair", 0, code)
+    s = Server(binary, hole_index)
+    check("indexed fallthrough: NE matches the scan", scan_ne, s.post("[[120.75,23.75]]")[1])
+    check("indexed fallthrough: NW hole matches the scan", scan_nw,
+          s.post("[[120.25,23.75]]")[1])
+    check("and the hole really is pierced", [9999], s.post("[[120.25,23.75]]")[1])
+    check_shutdown("indexed fallthrough", s)
+
+    print("== index: a broken entry is not touched until it is needed ==")
+    # Startup silence is the assertion. An eager server would report this file
+    # before binding; one that opened it and swallowed the error would still
+    # have paid for the round trip.
+    brokendir = tempfile.mkdtemp(prefix="demd-test-broken-")
+    mkdem(os.path.join(brokendir, "N23E120.hgt"))
+    run_cli(binary, "-w", index_of(brokendir), brokendir)
+    head, rows = read_index(index_of(brokendir))
+    broken = os.path.join(brokendir, "broken.tif")
+    with open(broken, "w") as f:
+        f.write("not a raster")
+    head = [h if not h.startswith("#count") else "#count 2" for h in head]
+    write_index(index_of(brokendir), head, rows + ["9\t118\t8\t119\t" + broken])
+    s = Server(binary, brokendir)
+    check("startup says nothing about the broken entry", False, "broken.tif" in s.output())
+    check("other datasets answer", [1000], s.post("[[120.25,23.75]]")[1])
+    check("still nothing about it", False, "broken.tif" in s.output())
+    check("a lookup inside it -> null", [None], s.post("[[118.5,8.5]]")[1])
+    check("and only now is it reported", True, "broken.tif" in s.output())
+    check_shutdown("broken index entry", s)
+
+    print("== index: a failed open is not permanent ==")
+    # Object storage returns 429 and 503 and recovers. Writing the first
+    # failure off for good would turn a blip into a tile that answers null for
+    # the rest of the process's life.
+    gonedir = tempfile.mkdtemp(prefix="demd-test-gone-")
+    mktif(os.path.join(gonedir, "later.tif"))
+    run_cli(binary, "-w", index_of(gonedir), gonedir)
+    stashed = os.path.join(gonedir, "later.tif")
+    with open(stashed, "rb") as f:
+        saved = f.read()
+    os.remove(stashed)
+    s = Server(binary, gonedir)
+    check("missing file -> null", [None], s.post("[[120.957283,23.47]]")[1])
+    with open(stashed, "wb") as f:
+        f.write(saved)
+    # The first backoff is two seconds.
+    time.sleep(3)
+    check("once it is back, so is the answer", [5000], s.post("[[120.957283,23.47]]")[1])
+    check_shutdown("recovered open", s)
+
+    print("== index: malformed indexes are refused ==")
+    baddir = tempfile.mkdtemp(prefix="demd-test-bad-")
+    mkdem(os.path.join(baddir, "N23E120.hgt"))
+    run_cli(binary, "-w", index_of(baddir), baddir)
+    head, rows = read_index(index_of(baddir))
+    truncated = os.path.join(baddir, "truncated.idx")
+    write_index(truncated, [h if not h.startswith("#count") else "#count 5" for h in head], rows)
+    code, out = run_cli(binary, truncated)
+    check("a truncated index exits nonzero", True, code != 0)
+    check("and says so", True, "truncated" in out)
+    garbage = os.path.join(baddir, "garbage.idx")
+    write_index(garbage, head, ["not\ta\tbounds\trow\t/x.tif"])
+    check("malformed bounds exit nonzero", True, run_cli(binary, garbage)[0] != 0)
+    inverted = os.path.join(baddir, "inverted.idx")
+    write_index(inverted, head, ["10\t120\t20\t121\t/x.tif"])
+    check("inverted bounds exit nonzero", True, run_cli(binary, inverted)[0] != 0)
+
+    print("== index: the SRS it was built for ==")
+    # The bounds are in the request SRS, so an index is only meaningful for the
+    # -s it was generated with. Equivalent spellings of the same SRS must not
+    # be rejected, which is why this compares with OSRIsSame() and not strcmp.
+    s = Server(binary, idxdir, "-s", "EPSG:4326")
+    check("EPSG:4326 against a WGS84 index still serves", [1000],
+          s.post("[[120.25,23.75]]")[1])
+    check_shutdown("equivalent SRS", s)
+    code, out = run_cli(binary, "-s", "EPSG:3826", idxdir)
+    check("a different SRS exits nonzero", True, code != 0)
+    check("and explains why", True, "different SRS" in out)
+
+    print("== index generator ==")
+    for given, want in [("gs://bucket/key.tif", "/vsigs/bucket/key.tif"),
+                        ("s3://bucket/key.tif", "/vsis3/bucket/key.tif"),
+                        ("https://host/key.tif", "/vsicurl/https://host/key.tif"),
+                        ("http://host/key.tif", "/vsicurl/http://host/key.tif"),
+                        ("/vsigs/bucket/key.tif", "/vsigs/bucket/key.tif"),
+                        ("/data/key.tif", "/data/key.tif"),
+                        ("relative/key.tif", "relative/key.tif")]:
+        code, out = run_cli(binary, "-P", given)
+        check("-P %-24s" % given, want, out.strip())
+
+    # One unreadable source fails the whole index rather than quietly leaving a
+    # hole, and publication is atomic: the index in service is untouched.
+    pubdir = tempfile.mkdtemp(prefix="demd-test-publish-")
+    mktif(os.path.join(pubdir, "a.tif"))
+    target = os.path.join(pubdir, "demd.index")
+    check("first publish succeeds", 0, run_cli(binary, "-w", target, pubdir)[0])
+    with open(target, "rb") as f:
+        before = f.read()
+    with open(os.path.join(pubdir, "z-broken.tif"), "w") as f:
+        f.write("not a raster")
+    code, out = run_cli(binary, "-w", target, pubdir)
+    check("a corrupt source fails the index", True, code != 0)
+    with open(target, "rb") as f:
+        after = f.read()
+    check("the published index is untouched", True, before == after)
+    check("no temporary is left behind", [],
+          [f for f in os.listdir(pubdir) if ".tmp." in f])
+
+    print("== index verification ==")
+    verdir = tempfile.mkdtemp(prefix="demd-test-verify-")
+    mktif(os.path.join(verdir, "a.tif"), "--value", "1111")
+    mktif(os.path.join(verdir, "b.tif"), "--value", "2222")
+    vindex = os.path.join(verdir, "demd.index")
+
+    def regenerate():
+        run_cli(binary, "-w", vindex, verdir)
+        return read_index(vindex)
+
+    head, rows = regenerate()
+    check("a fresh index verifies clean", 0, run_cli(binary, "-W", vindex, verdir)[0])
+    # Reordering changes no path, no count and no bbox -- only the answer. A
+    # verifier that compared sets would call this identical.
+    write_index(vindex, head, [rows[1], rows[0]])
+    code, out = run_cli(binary, "-W", vindex, verdir)
+    check("reordering is caught", True, code != 0)
+    check("reordering is named", True, "reordered" in out)
+    head, rows = regenerate()
+    fields = rows[0].split("\t")
+    fields[0] = "99"
+    write_index(vindex, head, ["\t".join(fields), rows[1]])
+    code, out = run_cli(binary, "-W", vindex, verdir)
+    check("changed bounds are caught", True, code != 0)
+    check("changed bounds are named", True, "bounds changed" in out)
+    head, rows = regenerate()
+    os.remove(os.path.join(verdir, "b.tif"))
+    code, out = run_cli(binary, "-W", vindex, verdir)
+    check("a removed source is caught", True, code != 0)
+    check("a removed source is named", True, "removed:" in out)
+    mktif(os.path.join(verdir, "b.tif"), "--value", "2222")
+    head, rows = regenerate()
+    mktif(os.path.join(verdir, "c.tif"), "--value", "3333")
+    code, out = run_cli(binary, "-W", vindex, verdir)
+    check("an added source is caught", True, code != 0)
+    check("an added source is named", True, "added:" in out)
+
+    print("== lazy open over HTTP: startup makes no round trips ==")
+    # The acceptance criterion behind all of this is that startup stops opening
+    # every DEM. That is a claim about I/O, so this counts the I/O: a server
+    # that opened the file and hid the error would be indistinguishable from a
+    # lazy one by any log-based check.
+    origin = None
+    try:
+        sys.path.insert(0, HERE)
+        import httpdem
+        remotedir = tempfile.mkdtemp(prefix="demd-test-remote-")
+        mktif(os.path.join(remotedir, "remote.tif"))
+        origin = httpdem.Origin(os.path.join(remotedir, "remote.tif"))
+    except Exception as e:
+        # Never a skip. This is the one check the whole change exists to make,
+        # and a silent skip would leave it absent from CI while looking green.
+        check("HTTP origin fixture starts", True, "failed: %r" % (e,))
+    if origin:
+        remote_index = os.path.join(remotedir, "demd.index")
+        # A bare URL, so the gs://-style rewrite is genuinely exercised rather
+        # than handed its own output.
+        code, out = run_cli(binary, "-w", remote_index, "--from-stdin",
+                            stdin=origin.url + "\n")
+        check("remote index written", 0, code)
+        with open(remote_index, encoding="utf-8") as f:
+            body = f.read()
+        check("the bare URL was rewritten for GDAL", True,
+              "/vsicurl/" + origin.url in body)
+        origin.reset()
+        s = Server(binary, remote_index)
+        check("binding the port made no request", 0, origin.requests)
+        check("a lookup outside the bounds -> null", [None], s.post("[[0.0,0.0]]")[1])
+        check("and still no request", 0, origin.requests)
+        check("a lookup inside answers", [5000], s.post("[[120.957283,23.47]]")[1])
+        check("which did take round trips", True, origin.requests > 0)
+        check_shutdown("remote index", s)
+        origin.stop()
+
+    print("== open files stay bounded ==")
+    # Deferring the open makes the dataset count unbounded, which makes open
+    # descriptors the next thing to run out. Exhausting them would surface as a
+    # tile that answers null -- the same shape as ground nobody has data for.
+    #
+    # The three tiles are stacked, not overlapping: over shared ground the
+    # first dataset answers and the others are never opened, so a cap would
+    # look like it worked no matter what it did.
+    capdir = tempfile.mkdtemp(prefix="demd-test-cap-")
+    mktif(os.path.join(capdir, "a.tif"), "--value", "1111")
+    mktif(os.path.join(capdir, "b.tif"), "--value", "2222", "--shift", "-600000")
+    mktif(os.path.join(capdir, "c.tif"), "--value", "3333", "--shift", "-1200000")
+    run_cli(binary, "-w", index_of(capdir), capdir)
+    NORTH, MIDDLE, SOUTH = "[[121.0,23.0]]", "[[121.0,18.0]]", "[[121.0,12.0]]"
+
+    s = Server(binary, capdir, "-n", "1")
+    check("stacked tiles: northern", [1111], s.post(NORTH)[1])
+    check("stacked tiles: middle", [2222], s.post(MIDDLE)[1])
+    check("stacked tiles: southern", [3333], s.post(SOUTH)[1])
+    held = open_dem_files(s.proc.pid)
+    if held is None:
+        check("open files are observable", True, "neither /proc nor lsof")
+    else:
+        check("-n 1 keeps one DEM open", 1, len(held))
+        for _ in range(10):
+            s.post(NORTH)
+            s.post(MIDDLE)
+            s.post(SOUTH)
+        check("still one after 30 lookups", 1, len(open_dem_files(s.proc.pid)))
+        check("and the answers are still right", [1111], s.post(NORTH)[1])
+    check_shutdown("open-file cap", s)
+
+    # The control. Without it, "one file open" could just as well mean the
+    # counter never sees anything.
+    s = Server(binary, capdir, "-n", "0")
+    s.post(NORTH)
+    s.post(MIDDLE)
+    s.post(SOUTH)
+    held = open_dem_files(s.proc.pid)
+    if held is not None:
+        check("uncapped keeps all three open", 3, len(held))
+    check_shutdown("uncapped", s)
 
     print()
     if failures:

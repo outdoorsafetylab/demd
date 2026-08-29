@@ -1,5 +1,6 @@
 .vscode
 *.o
+*.d
 *.tif
 *.tfw
 *.zip
@@ -7,3 +8,6 @@
 *.hgt
 demd
 debian
+
+# Python bytecode from the test helpers
+__pycache__

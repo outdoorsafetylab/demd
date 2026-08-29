@@ -7,7 +7,12 @@ struct context;
 // Paths are consulted in the order given, and the files inside a directory in
 // sorted order. The first dataset that yields a value for a coordinate wins,
 // so earlier paths take precedence over later ones.
-struct context *ContextCreate(const char **paths, size_t npaths, const char *, const char *);
+//
+// A path that is a demd index, or a directory holding one, loads from it and
+// defers opening each file until a lookup falls inside its bounds. max_open
+// caps how many stay open at once; 0 means no cap.
+struct context *ContextCreate(const char **paths, size_t npaths, const char *srs,
+                              const char *auth, size_t max_open);
 void ContextFree(struct context *);
 const char *ContextAuth(struct context *ctx);
 int ContextEmpty(struct context *ctx);
