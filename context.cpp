@@ -13,6 +13,7 @@
 #include "paths.h"
 #include "dataset.h"
 #include "index.h"
+#include "grid.h"
 #include "context.h"
 
 // The conventional name looked for inside a directory. It deliberately does
@@ -43,6 +44,11 @@ struct context {
     char *auth;
     char *srs_wkt;
     OGRSpatialReferenceH hReqSRS;
+    // Built once, after every path is loaded. `by_index` gives the grid's
+    // answers somewhere to point: the datasets themselves live in a queue
+    // because their order is precedence, and a queue cannot be indexed.
+    struct dataset_grid *grid;
+    struct dataset_item **by_index;
 };
 
 static void contextAddPath(struct context *ctx, const char *path);
@@ -51,6 +57,8 @@ static int contextAddIndex(struct context *ctx, const char *indexPath);
 static struct dataset_item *contextAppend(struct context *ctx, struct dataset *dataset);
 static void contextNoteOpened(struct context *ctx, struct dataset_item *item);
 static void contextTouch(struct context *ctx, struct dataset_item *item);
+static void contextBuildGrid(struct context *ctx);
+static double contextConsult(struct context *ctx, struct dataset_item *item, double x, double y);
 
 struct context *ContextCreate(const char **paths, size_t npaths, const char *srs,
                               const char *auth, size_t max_open) {
@@ -87,6 +95,7 @@ struct context *ContextCreate(const char **paths, size_t npaths, const char *srs
     for (size_t i = 0; i < npaths; i++) {
         contextAddPath(ctx, paths[i]);
     }
+    contextBuildGrid(ctx);
     if (strlen(auth) > 0) {
         ctx->auth = strdup(auth);
         if (!ctx->auth) {
@@ -198,6 +207,8 @@ void ContextFree(struct context *ctx) {
         free(item);
         item = next;
     }
+    GridFree(ctx->grid);
+    free(ctx->by_index);
     if (ctx->hReqSRS) {
         OSRDestroySpatialReference(ctx->hReqSRS);
     }
@@ -233,29 +244,82 @@ int ContextVerbose(struct context *ctx) {
 }
 
 double ContextGetAltitude(struct context *ctx, double x, double y) {
+    if (ctx->grid) {
+        struct grid_cursor cur;
+        size_t index;
+        GridBegin(ctx->grid, x, y, &cur);
+        while (GridNext(&cur, &index)) {
+            double alt = contextConsult(ctx, ctx->by_index[index], x, y);
+            if (!isnan(alt)) {
+                return alt;
+            }
+        }
+        return NAN;
+    }
+    // No grid: walk everything, which is what this always did. Reached when
+    // the grid could not be allocated, so the service degrades in speed
+    // rather than in answers.
     struct dataset_item *item;
     TAILQ_FOREACH(item, &ctx->datasets, entry) {
-        // The bounds test comes first and never opens anything, so a lookup
-        // costs four comparisons per dataset it does not hit.
-        if (!DatasetContains(item->dataset, x, y)) {
-            continue;
-        }
-        if (!DatasetIsOpen(item->dataset)) {
-            if (!DatasetOpen(item->dataset)) {
-                // Either it is broken or its backoff has not expired. Falling
-                // through is what the next dataset in precedence order is for.
-                continue;
-            }
-            contextNoteOpened(ctx, item);
-        } else if (ctx->max_open > 0) {
-            contextTouch(ctx, item);
-        }
-        double alt = DatasetGetAltitude(item->dataset, x, y);
+        double alt = contextConsult(ctx, item, x, y);
         if (!isnan(alt)) {
             return alt;
         }
     }
     return NAN;
+}
+
+// One dataset's turn. The grid narrows which datasets are asked; it never
+// decides the answer, so the bounds test stays here as the authority -- a cell
+// holds every box that overlaps it, not only those containing the point.
+double contextConsult(struct context *ctx, struct dataset_item *item, double x, double y) {
+    if (!DatasetContains(item->dataset, x, y)) {
+        return NAN;
+    }
+    if (!DatasetIsOpen(item->dataset)) {
+        if (!DatasetOpen(item->dataset)) {
+            // Either it is broken or its backoff has not expired. Falling
+            // through is what the next dataset in precedence order is for.
+            return NAN;
+        }
+        contextNoteOpened(ctx, item);
+    } else if (ctx->max_open > 0) {
+        contextTouch(ctx, item);
+    }
+    return DatasetGetAltitude(item->dataset, x, y);
+}
+
+void contextBuildGrid(struct context *ctx) {
+    if (ctx->num_datasets == 0) {
+        return;
+    }
+    struct grid_box *boxes = (struct grid_box *) calloc(ctx->num_datasets, sizeof(struct grid_box));
+    ctx->by_index = (struct dataset_item **) calloc(ctx->num_datasets, sizeof(struct dataset_item *));
+    if (!boxes || !ctx->by_index) {
+        fprintf(stderr, "Failed to allocate lookup grid: %s\n", strerror(errno));
+        free(boxes);
+        free(ctx->by_index);
+        ctx->by_index = NULL;
+        return;
+    }
+    struct dataset_item *item;
+    size_t i = 0;
+    TAILQ_FOREACH(item, &ctx->datasets, entry) {
+        DatasetGetBounds(item->dataset, &boxes[i].top, &boxes[i].left,
+            &boxes[i].bottom, &boxes[i].right);
+        ctx->by_index[i] = item;
+        i++;
+    }
+    ctx->grid = GridBuild(boxes, ctx->num_datasets);
+    free(boxes);
+    if (!ctx->grid) {
+        free(ctx->by_index);
+        ctx->by_index = NULL;
+        return;
+    }
+    size_t nx, ny, oversized;
+    GridStats(ctx->grid, &nx, &ny, &oversized);
+    printf("Lookup grid: %zux%zu cells, %zu oversized dataset(s)\n", nx, ny, oversized);
 }
 
 void contextAddDataset(struct context *ctx, const char *filepath) {
