@@ -40,6 +40,7 @@ struct context {
     size_t num_open;
     size_t max_open;
     size_t max_points;
+    size_t considered;
     int verbose;
     char *auth;
     char *srs_wkt;
@@ -246,6 +247,14 @@ int ContextVerbose(struct context *ctx) {
     return ctx->verbose;
 }
 
+size_t ContextConsidered(struct context *ctx) {
+    return ctx->considered;
+}
+
+void ContextResetConsidered(struct context *ctx) {
+    ctx->considered = 0;
+}
+
 double ContextGetAltitude(struct context *ctx, double x, double y) {
     // Only an empty context has no grid, and main() refuses to serve one.
     if (!ctx->grid) {
@@ -255,6 +264,7 @@ double ContextGetAltitude(struct context *ctx, double x, double y) {
     size_t index;
     GridBegin(ctx->grid, x, y, &cur);
     while (GridNext(&cur, &index)) {
+        ctx->considered++;
         double alt = contextConsult(ctx, ctx->by_index[index], x, y);
         if (!isnan(alt)) {
             return alt;

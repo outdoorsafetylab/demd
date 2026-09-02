@@ -21,5 +21,11 @@ size_t ContextMaxPoints(struct context *ctx);
 void ContextSetVerbose(struct context *ctx, int verbose);
 int ContextVerbose(struct context *ctx);
 double ContextGetAltitude(struct context *, double, double);
+// How many datasets the lookups since the last reset had to consider. The
+// grid's whole purpose is to keep this near one however many datasets are
+// loaded, and that is not visible in an answer: a grid that returned every
+// dataset for every cell would produce identical responses, only slowly.
+size_t ContextConsidered(struct context *ctx);
+void ContextResetConsidered(struct context *ctx);
 
 #endif // CONTEXT_H_

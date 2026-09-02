@@ -737,6 +737,39 @@ def main(binary):
     check("tiles first: a neighbouring tile", [1000], s.post("[[121.25,22.75]]")[1])
     check_shutdown("grid, tiles first", s)
 
+    print("== the grid narrows what a lookup considers ==")
+    # Answers cannot show this. A grid handing back every dataset for every
+    # cell responds identically -- contextConsult() re-checks the bounds, so
+    # the extra candidates are filtered out and the reply is correct -- just
+    # slowly. Without a count, a regression to the walk this replaces is
+    # invisible to the suite and shows up only as production latency, where
+    # the cause is a guess.
+    manydir = tempfile.mkdtemp(prefix="demd-test-many-")
+    real = os.path.join(manydir, "real.tif")
+    mktif(real)
+    seed = os.path.join(manydir, "seed.idx")
+    run_cli(binary, "-w", seed, real)
+    head, rows = read_index(seed)
+    # Ground the query never touches, so these are never opened and need not
+    # exist. They are here to make the dataset count large, which is the
+    # condition the grid exists for.
+    filler = ["%d\t%d\t%d\t%d\t/nonexistent/f_%d_%d.tif"
+              % (lat + 1, lon, lat, lon + 1, lon, lat)
+              for lon in range(-180, -80) for lat in range(-60, -40)]
+    many = os.path.join(manydir, "many.idx")
+    head = [h if not h.startswith("#count") else "#count %d" % (len(filler) + 1)
+            for h in head]
+    write_index(many, head, filler + rows)
+
+    s = Server(binary, many)
+    check("a lookup among %d datasets answers" % (len(filler) + 1), [5000],
+          s.post("[[120.957283,23.47]]")[1])
+    seen = re.findall(r"(\d+) dataset\(s\) considered", s.output())
+    check("the lookup was counted", True, bool(seen))
+    check("and considered a handful, not all of them", True,
+          bool(seen) and int(seen[-1]) <= 4)
+    check_shutdown("grid narrowing", s)
+
     print()
     if failures:
         print("FAILED %d of %d checks:" % (len(failures), checks))

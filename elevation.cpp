@@ -129,6 +129,7 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
             fprintf(stderr, "Failed to create JSON array for results: %s\n", strerror(errno));
             goto err;
         }
+        ContextResetConsidered(ctx);
         for (size_t i = 0; i < n; i++) {
             coords = json_object_array_get_idx(json, i);
             // json-c represents JSON null as a NULL pointer, and its array
@@ -165,7 +166,12 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
             sec--;
         }
         if (ContextVerbose(ctx)) {
-            fprintf(stderr, "Lookup %zu point(s) in %ld.%06ld sec\n", n, sec, usec);
+            // The dataset count is what says the grid is doing its job. It
+            // cannot be read off a response -- a grid handing back every
+            // dataset for every cell answers identically, just slowly -- and
+            // by the time that shows up as latency the cause is a guess.
+            fprintf(stderr, "Lookup %zu point(s) in %ld.%06ld sec, %zu dataset(s) considered\n",
+                n, sec, usec, ContextConsidered(ctx));
         }
     }
     evhttp_add_header(evhttp_request_get_output_headers(req), "Content-Type", contentType);
