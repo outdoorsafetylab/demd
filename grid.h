@@ -23,8 +23,10 @@ struct grid_box {
 };
 
 // Boxes are indexed by their position in this array, which is the precedence
-// order. Returns NULL if there is nothing to index or on allocation failure;
-// the caller then keeps walking the full list, which is correct, just slower.
+// order. Returns NULL on allocation failure, which the caller treats as fatal:
+// the only alternative is a second lookup path that no test exercises and that
+// would therefore run for the first time during the memory exhaustion that
+// produced it.
 struct dataset_grid *GridBuild(const struct grid_box *boxes, size_t n);
 void GridFree(struct dataset_grid *grid);
 

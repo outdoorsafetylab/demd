@@ -57,7 +57,7 @@ static int contextAddIndex(struct context *ctx, const char *indexPath);
 static struct dataset_item *contextAppend(struct context *ctx, struct dataset *dataset);
 static void contextNoteOpened(struct context *ctx, struct dataset_item *item);
 static void contextTouch(struct context *ctx, struct dataset_item *item);
-static void contextBuildGrid(struct context *ctx);
+static int contextBuildGrid(struct context *ctx);
 static double contextConsult(struct context *ctx, struct dataset_item *item, double x, double y);
 
 struct context *ContextCreate(const char **paths, size_t npaths, const char *srs,
@@ -95,7 +95,10 @@ struct context *ContextCreate(const char **paths, size_t npaths, const char *srs
     for (size_t i = 0; i < npaths; i++) {
         contextAddPath(ctx, paths[i]);
     }
-    contextBuildGrid(ctx);
+    if (!contextBuildGrid(ctx)) {
+        ContextFree(ctx);
+        return NULL;
+    }
     if (strlen(auth) > 0) {
         ctx->auth = strdup(auth);
         if (!ctx->auth) {
@@ -244,24 +247,15 @@ int ContextVerbose(struct context *ctx) {
 }
 
 double ContextGetAltitude(struct context *ctx, double x, double y) {
-    if (ctx->grid) {
-        struct grid_cursor cur;
-        size_t index;
-        GridBegin(ctx->grid, x, y, &cur);
-        while (GridNext(&cur, &index)) {
-            double alt = contextConsult(ctx, ctx->by_index[index], x, y);
-            if (!isnan(alt)) {
-                return alt;
-            }
-        }
+    // Only an empty context has no grid, and main() refuses to serve one.
+    if (!ctx->grid) {
         return NAN;
     }
-    // No grid: walk everything, which is what this always did. Reached when
-    // the grid could not be allocated, so the service degrades in speed
-    // rather than in answers.
-    struct dataset_item *item;
-    TAILQ_FOREACH(item, &ctx->datasets, entry) {
-        double alt = contextConsult(ctx, item, x, y);
+    struct grid_cursor cur;
+    size_t index;
+    GridBegin(ctx->grid, x, y, &cur);
+    while (GridNext(&cur, &index)) {
+        double alt = contextConsult(ctx, ctx->by_index[index], x, y);
         if (!isnan(alt)) {
             return alt;
         }
@@ -289,9 +283,14 @@ double contextConsult(struct context *ctx, struct dataset_item *item, double x, 
     return DatasetGetAltitude(item->dataset, x, y);
 }
 
-void contextBuildGrid(struct context *ctx) {
+// Fails the startup rather than falling back to a walk over every dataset.
+// That walk would be correct, but nothing would ever execute it: it is
+// unreachable except on allocation failure, so its first run would be inside
+// the memory exhaustion that caused it. A container restarting beats a second
+// lookup path nobody has tested.
+int contextBuildGrid(struct context *ctx) {
     if (ctx->num_datasets == 0) {
-        return;
+        return 1;
     }
     struct grid_box *boxes = (struct grid_box *) calloc(ctx->num_datasets, sizeof(struct grid_box));
     ctx->by_index = (struct dataset_item **) calloc(ctx->num_datasets, sizeof(struct dataset_item *));
@@ -300,7 +299,7 @@ void contextBuildGrid(struct context *ctx) {
         free(boxes);
         free(ctx->by_index);
         ctx->by_index = NULL;
-        return;
+        return 0;
     }
     struct dataset_item *item;
     size_t i = 0;
@@ -315,11 +314,12 @@ void contextBuildGrid(struct context *ctx) {
     if (!ctx->grid) {
         free(ctx->by_index);
         ctx->by_index = NULL;
-        return;
+        return 0;
     }
     size_t nx, ny, oversized;
     GridStats(ctx->grid, &nx, &ny, &oversized);
     printf("Lookup grid: %zux%zu cells, %zu oversized dataset(s)\n", nx, ny, oversized);
+    return 1;
 }
 
 void contextAddDataset(struct context *ctx, const char *filepath) {
