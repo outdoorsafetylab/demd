@@ -697,6 +697,79 @@ def main(binary):
         check("uncapped keeps all three open", 3, len(held))
     check_shutdown("uncapped", s)
 
+    print("== lookup grid ==")
+    # A raster far larger than the median dataset is not enumerated into every
+    # cell it covers -- it goes on a list consulted alongside whatever the
+    # cell holds. That list is where precedence can break silently: merged in
+    # the wrong place it changes which dataset answers without changing the
+    # set of datasets involved, and both orders look equally plausible in a
+    # response.
+    griddir = tempfile.mkdtemp(prefix="demd-test-grid-")
+    names = ("N22E120.hgt", "N22E121.hgt", "N23E120.hgt", "N23E121.hgt")
+    for name in names:
+        mkdem(os.path.join(griddir, name))
+    tiles = [os.path.join(griddir, n) for n in names]
+    wide = os.path.join(griddir, "wide.tif")
+    mktif(wide, "--rotated", "--value", "5000")
+
+    wide_first = os.path.join(griddir, "wide-first.idx")
+    tiles_first = os.path.join(griddir, "tiles-first.idx")
+    check("index, wide raster first", 0, run_cli(binary, "-w", wide_first, wide, *tiles)[0])
+    check("index, tiles first", 0, run_cli(binary, "-w", tiles_first, *tiles, wide)[0])
+
+    s = Server(binary, wide_first)
+    # Without this the two orders below prove nothing about the oversized
+    # path: they would pass identically on a build that never used it.
+    check("the wide raster is oversized for the grid", True,
+          "1 oversized dataset(s)" in s.output())
+    check("wide first: it answers over the tile", [5000], s.post("[[120.25,23.75]]")[1])
+    # North of every tile, but well inside the rotated raster -- the bbox
+    # corners of a rotated square are not covered by the square, so a point
+    # has to be chosen inside the image, not merely inside its envelope.
+    check("wide first: ground only it covers", [5000], s.post("[[121.5,25.03]]")[1])
+    check("outside every dataset -> null", [None], s.post("[[0.0,0.0]]")[1])
+    check_shutdown("grid, wide first", s)
+
+    s = Server(binary, tiles_first)
+    check("tiles first: the tile answers", [1000], s.post("[[120.25,23.75]]")[1])
+    check("tiles first: ground only the wide raster covers", [5000],
+          s.post("[[121.5,25.03]]")[1])
+    check("tiles first: a neighbouring tile", [1000], s.post("[[121.25,22.75]]")[1])
+    check_shutdown("grid, tiles first", s)
+
+    print("== the grid narrows what a lookup considers ==")
+    # Answers cannot show this. A grid handing back every dataset for every
+    # cell responds identically -- contextConsult() re-checks the bounds, so
+    # the extra candidates are filtered out and the reply is correct -- just
+    # slowly. Without a count, a regression to the walk this replaces is
+    # invisible to the suite and shows up only as production latency, where
+    # the cause is a guess.
+    manydir = tempfile.mkdtemp(prefix="demd-test-many-")
+    real = os.path.join(manydir, "real.tif")
+    mktif(real)
+    seed = os.path.join(manydir, "seed.idx")
+    run_cli(binary, "-w", seed, real)
+    head, rows = read_index(seed)
+    # Ground the query never touches, so these are never opened and need not
+    # exist. They are here to make the dataset count large, which is the
+    # condition the grid exists for.
+    filler = ["%d\t%d\t%d\t%d\t/nonexistent/f_%d_%d.tif"
+              % (lat + 1, lon, lat, lon + 1, lon, lat)
+              for lon in range(-180, -80) for lat in range(-60, -40)]
+    many = os.path.join(manydir, "many.idx")
+    head = [h if not h.startswith("#count") else "#count %d" % (len(filler) + 1)
+            for h in head]
+    write_index(many, head, filler + rows)
+
+    s = Server(binary, many)
+    check("a lookup among %d datasets answers" % (len(filler) + 1), [5000],
+          s.post("[[120.957283,23.47]]")[1])
+    seen = re.findall(r"(\d+) dataset\(s\) considered", s.output())
+    check("the lookup was counted", True, bool(seen))
+    check("and considered a handful, not all of them", True,
+          bool(seen) and int(seen[-1]) <= 4)
+    check_shutdown("grid narrowing", s)
+
     print()
     if failures:
         print("FAILED %d of %d checks:" % (len(failures), checks))

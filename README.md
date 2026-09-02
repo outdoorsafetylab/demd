@@ -149,6 +149,32 @@ server refuses to start on a mismatch rather than answer from a box that means
 something else. Equivalent spellings (`WGS84`, `EPSG:4326`) are the same SRS
 and are accepted for one another.
 
+## Lookup cost
+
+Every point used to be tried against every dataset in turn, which is free at a
+handful of rasters and is not at tens of thousands: the walk does not care how
+many datasets a request touches, only how far down the list the answering one
+sits. A tile in the middle of a global index costs the same per point whether
+the query hits it or misses everything.
+
+Datasets are therefore indexed into a uniform grid at load time, sized after
+the median dataset rather than after the coordinate system — bounds are in
+whatever SRS requests arrive in, so degrees and metres are both possible. A
+lookup consults one cell instead of the whole list, and a point outside every
+dataset is rejected outright.
+
+The grid narrows *which* datasets are asked; it never decides the answer.
+Bounds are still checked per dataset, and candidates are still visited in the
+order the index gave, so precedence and NoData fallthrough are unchanged.
+
+A raster much larger than the median is not copied into every cell it covers;
+it goes on a short list consulted alongside whatever the cell holds, merged in
+index order. Startup reports both:
+
+```
+Lookup grid: 357x112 cells, 0 oversized dataset(s)
+```
+
 ## Open files
 
 With the open deferred, the number of datasets stops bounding the number of
