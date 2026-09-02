@@ -29,7 +29,7 @@ struct dataset_grid {
 };
 
 static int compareDouble(const void *a, const void *b);
-static double medianExtent(const struct grid_box *boxes, size_t n, int vertical);
+static double medianExtent(const struct grid_box *boxes, size_t n, int vertical, double *scratch);
 static size_t cellIndex(const struct dataset_grid *g, double v, double min, double cell, size_t n);
 static void boxCells(const struct dataset_grid *g, const struct grid_box *b,
                      size_t *x0, size_t *x1, size_t *y0, size_t *y1);
@@ -53,6 +53,18 @@ struct dataset_grid *GridBuild(const struct grid_box *boxes, size_t n) {
         if (boxes[i].bottom < g->min_y) g->min_y = boxes[i].bottom;
         if (boxes[i].top > g->max_y) g->max_y = boxes[i].top;
     }
+    // One scratch buffer for both medians, allocated here so that failing to
+    // get it is the same failure as any other -- a NULL grid, and no startup.
+    // Letting medianExtent() report a failed allocation as "no usable extent"
+    // would substitute the full span, build a single-cell grid, and restore
+    // the per-point walk over every dataset with nothing said about it.
+    double *scratch = (double *) calloc(n, sizeof(double));
+    if (!scratch) {
+        fprintf(stderr, "Failed to allocate lookup grid: %s\n", strerror(errno));
+        GridFree(g);
+        return NULL;
+    }
+
     double span_x = g->max_x - g->min_x;
     double span_y = g->max_y - g->min_y;
     if (!(span_x > 0)) span_x = 1;
@@ -63,8 +75,11 @@ struct dataset_grid *GridBuild(const struct grid_box *boxes, size_t n) {
     // both possible and a fixed cell size would be wrong in one of them. The
     // median rather than the mean, so a handful of large rasters among many
     // tiles does not coarsen the grid for all of them.
-    double w = medianExtent(boxes, n, 0);
-    double h = medianExtent(boxes, n, 1);
+    double w = medianExtent(boxes, n, 0, scratch);
+    double h = medianExtent(boxes, n, 1, scratch);
+    free(scratch);
+    // Zero here is a property of the data -- every box degenerate in that axis
+    // -- not a failure, and one cell across is the right answer for it.
     if (!(w > 0)) w = span_x;
     if (!(h > 0)) h = span_y;
 
@@ -224,11 +239,7 @@ int compareDouble(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-double medianExtent(const struct grid_box *boxes, size_t n, int vertical) {
-    double *v = (double *) calloc(n, sizeof(double));
-    if (!v) {
-        return 0;
-    }
+double medianExtent(const struct grid_box *boxes, size_t n, int vertical, double *v) {
     size_t kept = 0;
     for (size_t i = 0; i < n; i++) {
         double d = vertical ? (boxes[i].top - boxes[i].bottom)
@@ -242,6 +253,5 @@ double medianExtent(const struct grid_box *boxes, size_t n, int vertical) {
         qsort(v, kept, sizeof(double), compareDouble);
         median = v[kept / 2];
     }
-    free(v);
     return median;
 }
