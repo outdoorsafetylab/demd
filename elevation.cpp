@@ -9,8 +9,6 @@
 
 #include <event2/buffer.h>
 #include <event2/http.h>
-#include <sys/queue.h>
-#include <event2/keyvalq_struct.h>
 #include <json-c/json.h>
 
 #if JSON_C_VERSION_NUM < 0x000D00
@@ -244,7 +242,11 @@ int coordValue(json_object *obj, double *val) {
 // caller that never heard of it gets byte-for-byte what it always got. Any
 // other value is refused rather than read as "no": a caller that asked for
 // detail and silently got bare numbers would misread every one of them.
-// Other query parameters are ignored, as they always were.
+//
+// Only `detail` is looked at. Every other parameter is ignored, as the whole
+// query always was -- which is why this does not use evhttp_parse_query_str():
+// it rejects a query with any parameter lacking `=`, so `?nocache` would turn
+// from ignored into a 400.
 int detailRequested(struct evhttp_request *req, int *detail) {
     *detail = 0;
     const struct evhttp_uri *uri = evhttp_request_get_evhttp_uri(req);
@@ -252,21 +254,24 @@ int detailRequested(struct evhttp_request *req, int *detail) {
     if (!query) {
         return 1;
     }
-    struct evkeyvalq params;
-    TAILQ_INIT(&params);
-    if (evhttp_parse_query_str(query, &params) != 0) {
-        evhttp_clear_headers(&params);
-        return 0;
-    }
+    static const char key[] = "detail";
+    const size_t keylen = sizeof(key) - 1;
     int ok = 1;
-    const char *value = evhttp_find_header(&params, "detail");
-    if (value) {
-        if (strcmp(value, "1") == 0) {
-            *detail = 1;
-        } else {
-            ok = 0;
+    for (const char *p = query; ok; ) {
+        const char *end = strchr(p, '&');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len >= keylen && strncmp(p, key, keylen) == 0 &&
+            (len == keylen || p[keylen] == '=')) {
+            if (len == keylen + 2 && p[keylen + 1] == '1') {
+                *detail = 1;
+            } else {
+                ok = 0;
+            }
         }
+        if (!end) {
+            break;
+        }
+        p = end + 1;
     }
-    evhttp_clear_headers(&params);
     return ok;
 }
