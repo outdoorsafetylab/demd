@@ -102,6 +102,26 @@ A directory holding a `demd.index` loads from it. A directory without one is
 scanned and opened exactly as before, so an existing deployment needs no change
 at all.
 
+## Which layer answered
+
+Each path argument is a layer, tried in the order given; a point takes its value
+from the first layer that has one there. `?detail=1` reports which layer that
+was:
+
+```shell
+$ curl -XPOST --data '[[120.957283,23.47],[125,30]]' 'http://127.0.0.1:8082/v1/elevations?detail=1'
+[ { "m": 3917.0, "src": "moi2025" }, { "m": null } ]
+```
+
+A layer is named after its argument's last path component, without the
+extension for a file: `/data/moi2025/` is `moi2025`, `/data/glo30.index` is
+`glo30`. So to tell layers apart they must be separate arguments -- one index
+per layer, not one index listing all of them, which would name every point after
+that single index.
+
+Without `detail` the reply is the bare array, unchanged. Any other value of
+`detail` is a 400; other query parameters are ignored.
+
 ## Remote data
 
 Object storage listings name their objects with a scheme GDAL does not take, so

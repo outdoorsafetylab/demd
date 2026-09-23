@@ -63,10 +63,19 @@ class Server:
                 time.sleep(0.1)
         raise RuntimeError("server never bound a port:\n" + self.output())
 
-    def post(self, body, method="POST", headers=None):
+    def raw(self, body, query=""):
+        """Returns (status, body bytes exactly as sent). Never raises for HTTP errors."""
+        req = urllib.request.Request(self.url + query, data=body.encode(), method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, None
+
+    def post(self, body, method="POST", headers=None, query=""):
         """Returns (status, parsed-body-or-None). Never raises for HTTP errors."""
         data = body if isinstance(body, bytes) else body.encode()
-        req = urllib.request.Request(self.url, data=data, method=method)
+        req = urllib.request.Request(self.url + query, data=data, method=method)
         for k, v in (headers or {}).items():
             req.add_header(k, v)
         try:
@@ -769,6 +778,76 @@ def main(binary):
     check("and considered a handful, not all of them", True,
           bool(seen) and int(seen[-1]) <= 4)
     check_shutdown("grid narrowing", s)
+
+    print("== detail: each point names the layer that answered ==")
+    # A layer is one path argument and is named after it, so what an operator
+    # types on the command line is what a caller reads back.
+    layers = tempfile.mkdtemp(prefix="demd-test-layers-")
+    moi2025 = os.path.join(layers, "moi2025")
+    moi2020 = os.path.join(layers, "moi2020")
+    os.mkdir(moi2025)
+    os.mkdir(moi2020)
+    mkdem(os.path.join(moi2025, "N23E120.hgt"), "--hole-nw")
+    mkdem(os.path.join(moi2020, "N23E120.hgt"), "--fill", "9999")
+    # NE and SW from the top layer, NW through its hole, and one point that
+    # nothing covers. Order is what makes a mixed batch checkable.
+    batch = "[[120.75,23.75],[120.25,23.75],[125.0,30.0],[120.25,23.25]]"
+    s = Server(binary, [moi2025, moi2020])
+    # Captured from master (3ec81a7) with this exact layout. Bytes, not parsed
+    # JSON: a caller that never asks for detail must not see a single one move.
+    check("no query: bytes identical to before detail existed",
+          (200, b"[ 2000.0, 9999.0, null, 3000.0 ]\n"), s.raw(batch))
+    check("detail=1: value and layer per point, in order",
+          (200, [{"m": 2000, "src": "moi2025"}, {"m": 9999, "src": "moi2020"},
+                 {"m": None}, {"m": 3000, "src": "moi2025"}]),
+          s.post(batch, query="?detail=1"))
+    check("detail=1: values match the bare reply",
+          [2000, 9999, None, 3000],
+          [p["m"] for p in s.post(batch, query="?detail=1")[1]])
+    check("an uncovered point carries no src at all", {"m": None},
+          s.post("[[125.0,30.0]]", query="?detail=1")[1][0])
+    # Refused, not read as "no detail": the caller asked for something and
+    # would misread bare numbers as the shape it asked for.
+    check("detail=0 -> 400", 400, s.raw(batch, "?detail=0")[0])
+    check("detail=abc -> 400", 400, s.raw(batch, "?detail=abc")[0])
+    check("detail with no value -> 400", 400, s.raw(batch, "?detail")[0])
+    check("detail=1 then detail=0 -> 400", 400, s.raw(batch, "?detail=1&detail=0")[0])
+    # Every other parameter was ignored before this existed and still is --
+    # including one without `=`, which libevent's own query parser rejects.
+    check("unrelated params: bytes unchanged",
+          (200, b"[ 2000.0, 9999.0, null, 3000.0 ]\n"), s.raw(batch, "?nocache&x=1"))
+    check("a param merely starting with detail is not detail",
+          (200, b"[ 2000.0, 9999.0, null, 3000.0 ]\n"), s.raw(batch, "?details=0"))
+    check("detail=1 among other params, bare flag included",
+          [{"m": 2000, "src": "moi2025"}],
+          s.post("[[120.75,23.75]]", query="?nocache&detail=1&x=y")[1])
+    check_shutdown("detail over directories", s)
+
+    # Swapping the order swaps who answers, and the names follow the data,
+    # not the position.
+    s = Server(binary, [moi2020, moi2025])
+    check("order swapped: NE now from moi2020",
+          [{"m": 9999, "src": "moi2020"}], s.post("[[120.75,23.75]]", query="?detail=1")[1])
+    check_shutdown("detail order swapped", s)
+
+    # Production shapes: a layer given as an index file is named after the
+    # file without its extension; a directory holding demd.index is named
+    # after the directory; a single raster file after the file.
+    glo30 = os.path.join(tempfile.mkdtemp(prefix="demd-test-glo30-"), "glo30.index")
+    code, out = run_cli(binary, "-w", glo30, moi2020)
+    check("index written for the file-named layer", 0, code)
+    run_cli(binary, "-w", index_of(moi2025), moi2025)
+    s = Server(binary, [moi2025 + "/", glo30,
+                        os.path.join(moi2025, "N23E120.hgt")])
+    check("dir holding demd.index -> dir name (trailing slash ignored)",
+          [{"m": 2000, "src": "moi2025"}], s.post("[[120.75,23.75]]", query="?detail=1")[1])
+    check("glo30.index -> glo30",
+          [{"m": 9999, "src": "glo30"}], s.post("[[120.25,23.75]]", query="?detail=1")[1])
+    check_shutdown("detail over index files", s)
+    s = Server(binary, [os.path.join(moi2020, "N23E120.hgt")])
+    check("single raster file -> file name without extension",
+          [{"m": 9999, "src": "N23E120"}], s.post("[[120.75,23.75]]", query="?detail=1")[1])
+    check_shutdown("detail over a single file", s)
 
     print()
     if failures:
