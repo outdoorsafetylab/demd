@@ -22,6 +22,9 @@
 
 struct dataset_item {
     struct dataset *dataset;
+    // The layer this dataset came from: owned by the context, shared by every
+    // dataset loaded from the same path argument.
+    const char *src;
     TAILQ_ENTRY(dataset_item) entry;
     TAILQ_ENTRY(dataset_item) open_entry;
     int listed;
@@ -44,6 +47,10 @@ struct context {
     int verbose;
     char *auth;
     char *srs_wkt;
+    // One name per path argument, in argument order. A layer is what the
+    // operator named on the command line, however many datasets it expands to.
+    char **layers;
+    size_t num_layers;
     OGRSpatialReferenceH hReqSRS;
     // Built once, after every path is loaded. `by_index` gives the grid's
     // answers somewhere to point: the datasets themselves live in a queue
@@ -53,9 +60,11 @@ struct context {
 };
 
 static void contextAddPath(struct context *ctx, const char *path);
-static void contextAddDataset(struct context *ctx, const char *filepath);
-static int contextAddIndex(struct context *ctx, const char *indexPath);
-static struct dataset_item *contextAppend(struct context *ctx, struct dataset *dataset);
+static void contextAddDataset(struct context *ctx, const char *filepath, const char *src);
+static int contextAddIndex(struct context *ctx, const char *indexPath, const char *src);
+static struct dataset_item *contextAppend(struct context *ctx, struct dataset *dataset,
+                                          const char *src);
+static const char *contextAddLayer(struct context *ctx, const char *path);
 static void contextNoteOpened(struct context *ctx, struct dataset_item *item);
 static void contextTouch(struct context *ctx, struct dataset_item *item);
 static int contextBuildGrid(struct context *ctx);
@@ -116,20 +125,24 @@ void contextAddPath(struct context *ctx, const char *path) {
         fprintf(stderr, "%s: %s\n", strerror(ENOENT), path);
         return;
     }
+    const char *src = contextAddLayer(ctx, path);
+    if (!src) {
+        return;
+    }
     if (!PathIsDir(path)) {
         // Recognition is by content: an index handed over directly is still an
         // index, whatever it is called.
         if (IndexLooksLikeIndex(path)) {
-            contextAddIndex(ctx, path);
+            contextAddIndex(ctx, path, src);
         } else {
-            contextAddDataset(ctx, path);
+            contextAddDataset(ctx, path, src);
         }
         return;
     }
     char indexPath[1024];
     PathJoin(indexPath, sizeof(indexPath), path, CONTEXT_INDEX_NAME);
     if (PathExists(indexPath) && IndexLooksLikeIndex(indexPath)) {
-        contextAddIndex(ctx, indexPath);
+        contextAddIndex(ctx, indexPath, src);
         return;
     }
     char **list = NULL;
@@ -138,12 +151,51 @@ void contextAddPath(struct context *ctx, const char *path) {
         return;
     }
     for (int i = 0; i < n; i++) {
-        contextAddDataset(ctx, list[i]);
+        contextAddDataset(ctx, list[i], src);
     }
     PathListFree(list, (size_t) n);
 }
 
-int contextAddIndex(struct context *ctx, const char *indexPath) {
+// Names the layer a path argument contributes: the last path component, with
+// the extension dropped when the argument is a file. A directory `/data/moi2025`
+// and an index file `/data/glo30.index` become `moi2025` and `glo30`.
+//
+// The name comes from the argument rather than from each dataset's own path on
+// purpose. Entries of one layer need not share a directory -- a global layer's
+// entries point into someone else's bucket, one directory per tile -- so a name
+// derived per entry would not be one name per layer, and the whole point of the
+// name is that consumers can look it up.
+const char *contextAddLayer(struct context *ctx, const char *path) {
+    size_t len = strlen(path);
+    while (len > 1 && path[len - 1] == '/') {
+        len--;
+    }
+    size_t start = len;
+    while (start > 0 && path[start - 1] != '/') {
+        start--;
+    }
+    size_t end = len;
+    if (!PathIsDir(path)) {
+        for (size_t i = len; i > start + 1; i--) {
+            if (path[i - 1] == '.') {
+                end = i - 1;
+                break;
+            }
+        }
+    }
+    char *name = strndup(path + start, end - start);
+    char **grown = name ? (char **) realloc(ctx->layers, (ctx->num_layers + 1) * sizeof(char *)) : NULL;
+    if (!grown) {
+        fprintf(stderr, "Failed to allocate layer name: %s\n", strerror(errno));
+        free(name);
+        return NULL;
+    }
+    ctx->layers = grown;
+    ctx->layers[ctx->num_layers++] = name;
+    return name;
+}
+
+int contextAddIndex(struct context *ctx, const char *indexPath, const char *src) {
     struct dem_index *idx = IndexRead(indexPath);
     if (!idx) {
         return 0;
@@ -178,7 +230,7 @@ int contextAddIndex(struct context *ctx, const char *indexPath) {
             IndexFree(idx);
             return 0;
         }
-        if (!contextAppend(ctx, dataset)) {
+        if (!contextAppend(ctx, dataset, src)) {
             DatasetFree(dataset);
             IndexFree(idx);
             return 0;
@@ -213,6 +265,10 @@ void ContextFree(struct context *ctx) {
     }
     GridFree(ctx->grid);
     free(ctx->by_index);
+    for (size_t i = 0; i < ctx->num_layers; i++) {
+        free(ctx->layers[i]);
+    }
+    free(ctx->layers);
     if (ctx->hReqSRS) {
         OSRDestroySpatialReference(ctx->hReqSRS);
     }
@@ -256,6 +312,13 @@ void ContextResetConsidered(struct context *ctx) {
 }
 
 double ContextGetAltitude(struct context *ctx, double x, double y) {
+    return ContextGetAltitudeFrom(ctx, x, y, NULL);
+}
+
+double ContextGetAltitudeFrom(struct context *ctx, double x, double y, const char **src) {
+    if (src) {
+        *src = NULL;
+    }
     // Only an empty context has no grid, and main() refuses to serve one.
     if (!ctx->grid) {
         return NAN;
@@ -265,8 +328,12 @@ double ContextGetAltitude(struct context *ctx, double x, double y) {
     GridBegin(ctx->grid, x, y, &cur);
     while (GridNext(&cur, &index)) {
         ctx->considered++;
-        double alt = contextConsult(ctx, ctx->by_index[index], x, y);
+        struct dataset_item *item = ctx->by_index[index];
+        double alt = contextConsult(ctx, item, x, y);
         if (!isnan(alt)) {
+            if (src) {
+                *src = item->src;
+            }
             return alt;
         }
     }
@@ -332,13 +399,13 @@ int contextBuildGrid(struct context *ctx) {
     return 1;
 }
 
-void contextAddDataset(struct context *ctx, const char *filepath) {
+void contextAddDataset(struct context *ctx, const char *filepath, const char *src) {
     struct dataset *dataset = DatasetCreate(filepath, ctx->hReqSRS);
     if (!dataset) {
         fprintf(stderr, "Failed to load dataset: %s\n", filepath);
         return;
     }
-    struct dataset_item *item = contextAppend(ctx, dataset);
+    struct dataset_item *item = contextAppend(ctx, dataset, src);
     if (!item) {
         DatasetFree(dataset);
         return;
@@ -351,13 +418,15 @@ void contextAddDataset(struct context *ctx, const char *filepath) {
         ctx->num_datasets, filepath, top, left, bottom, right);
 }
 
-struct dataset_item *contextAppend(struct context *ctx, struct dataset *dataset) {
+struct dataset_item *contextAppend(struct context *ctx, struct dataset *dataset,
+                                   const char *src) {
     struct dataset_item *item = (struct dataset_item *) calloc(1, sizeof(struct dataset_item));
     if (!item) {
         fprintf(stderr, "Failed to allocate dataset item: %s\n", strerror(errno));
         return NULL;
     }
     item->dataset = dataset;
+    item->src = src;
     ctx->num_datasets++;
     TAILQ_INSERT_TAIL(&ctx->datasets, item, entry);
     return item;

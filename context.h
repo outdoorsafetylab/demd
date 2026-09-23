@@ -21,6 +21,10 @@ size_t ContextMaxPoints(struct context *ctx);
 void ContextSetVerbose(struct context *ctx, int verbose);
 int ContextVerbose(struct context *ctx);
 double ContextGetAltitude(struct context *, double, double);
+// Same lookup, also naming the layer that answered: the path argument the
+// winning dataset was loaded from (see contextAddLayer). *src is set to NULL
+// when no layer holds a value. The string lives as long as the context.
+double ContextGetAltitudeFrom(struct context *, double, double, const char **src);
 // How many datasets the lookups since the last reset had to consider. The
 // grid's whole purpose is to keep this near one however many datasets are
 // loaded, and that is not visible in an answer: a grid that returned every

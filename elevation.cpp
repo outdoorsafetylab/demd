@@ -9,6 +9,8 @@
 
 #include <event2/buffer.h>
 #include <event2/http.h>
+#include <sys/queue.h>
+#include <event2/keyvalq_struct.h>
 #include <json-c/json.h>
 
 #if JSON_C_VERSION_NUM < 0x000D00
@@ -22,6 +24,7 @@
 static const char *contentType = "application/json; charset=utf-8";
 
 static int coordValue(json_object *obj, double *val);
+static int detailRequested(struct evhttp_request *req, int *detail);
 
 void elevation_request_cb(struct evhttp_request *req, void *arg) {
     context *ctx = (context *)arg;
@@ -47,6 +50,14 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
             evhttp_send_error(req, 401, NULL);
             return;
         }
+    }
+
+    // Decided before the body is read: a request naming an unknown detail level
+    // is malformed however valid its coordinates are.
+    int detail;
+    if (!detailRequested(req, &detail)) {
+        evhttp_send_error(req, 400, NULL);
+        return;
     }
 
     output = evbuffer_new();
@@ -145,10 +156,26 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
                 evhttp_send_error(req, 400, NULL);
                 goto done;
             }
-            double alt = ContextGetAltitude(ctx, xVal, yVal);
+            const char *src = NULL;
+            double alt = ContextGetAltitudeFrom(ctx, xVal, yVal, &src);
             json_object *val = NULL;
             if (!isnan(alt)) {
                 val = json_object_new_double(alt);
+            }
+            if (detail) {
+                // {"m": value, "src": layer}, or {"m": null} with no src: a
+                // point nothing covers has no source to name.
+                json_object *point = json_object_new_object();
+                if (!point) {
+                    json_object_put(val);
+                    fprintf(stderr, "Failed to create JSON object for a result: %s\n", strerror(errno));
+                    goto err;
+                }
+                json_object_object_add(point, "m", val);
+                if (val && src) {
+                    json_object_object_add(point, "src", json_object_new_string(src));
+                }
+                val = point;
             }
             json_object_array_add(result, val);
         }
@@ -211,4 +238,35 @@ int coordValue(json_object *obj, double *val) {
     default:
         return 0;
     }
+}
+
+// `?detail=1` asks for each point's layer. Absent means the bare array, so a
+// caller that never heard of it gets byte-for-byte what it always got. Any
+// other value is refused rather than read as "no": a caller that asked for
+// detail and silently got bare numbers would misread every one of them.
+// Other query parameters are ignored, as they always were.
+int detailRequested(struct evhttp_request *req, int *detail) {
+    *detail = 0;
+    const struct evhttp_uri *uri = evhttp_request_get_evhttp_uri(req);
+    const char *query = uri ? evhttp_uri_get_query(uri) : NULL;
+    if (!query) {
+        return 1;
+    }
+    struct evkeyvalq params;
+    TAILQ_INIT(&params);
+    if (evhttp_parse_query_str(query, &params) != 0) {
+        evhttp_clear_headers(&params);
+        return 0;
+    }
+    int ok = 1;
+    const char *value = evhttp_find_header(&params, "detail");
+    if (value) {
+        if (strcmp(value, "1") == 0) {
+            *detail = 1;
+        } else {
+            ok = 0;
+        }
+    }
+    evhttp_clear_headers(&params);
+    return ok;
 }
