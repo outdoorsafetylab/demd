@@ -216,6 +216,12 @@ void poolDrain(evutil_socket_t fd, short events, void *arg) {
 // one is waiting; a pipelined request is evhttp's to read once this reply is
 // out, so the watch just ends. It is not persistent, so it fires once either
 // way.
+//
+// EOF is also what a half-close (shutdown(SHUT_WR)) looks like, from a client
+// that may still read the reply. The two cannot be told apart here, and like
+// nginx (499) this takes EOF as the client being gone: the case this exists
+// for -- a proxy timing out -- is a full close, and half-close-then-wait is
+// rare over HTTP. See README "Lookup threads".
 void poolPeek(evutil_socket_t fd, short events, void *arg) {
     (void) events;
     struct elevation_job *job = (struct elevation_job *) arg;

@@ -225,7 +225,9 @@ wait gets long. `-t <n>` moves lookups to `n` worker threads instead:
 - **A lookup whose client has gone away stops** at the next point instead of
   running to the end. This is what frees a worker when a proxy's timeout gives
   up on a request: the proxy closes the connection, and nothing would ever read
-  the rest.
+  the rest. A client that only half-closes (`shutdown(SHUT_WR)`) and then waits
+  for the reply looks the same from the socket, so it is treated as gone too,
+  as nginx does (499). `-t 1` never notices either.
 - Replies are byte-for-byte those of `-t 1`, errors included.
 
 Keep `-m`: without a per-request cap, `n` large requests still occupy every

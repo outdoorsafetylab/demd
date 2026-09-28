@@ -210,8 +210,12 @@ def check_clean(name, server):
     for marker in ("AddressSanitizer", "LeakSanitizer", "ThreadSanitizer", "runtime error:",
                    "Segmentation fault", "MemorySanitizer"):
         if marker in out:
+            # From the report's start: its first stack is the access that
+            # raced or faulted, and the tail alone cuts it off.
+            lines = out.splitlines()
+            start = next((i for i, l in enumerate(lines) if marker in l or "WARNING:" in l), 0)
             print("  FAIL  %-46s sanitizer/crash output:" % name)
-            print("\n".join("        " + l for l in out.splitlines()[-30:]))
+            print("\n".join("        " + l for l in lines[max(0, start - 2):start + 60]))
             failures.append(name)
             return
     check(name, True, True)
@@ -975,12 +979,45 @@ def threads_section(binary, demdir):
     check("and the server still answers", (200, [1000]), s.post(LOCAL))
     check_shutdown("abandoned lookup", s)
 
+    # A half-close counts as gone. From the socket alone it cannot be told from
+    # a full close -- both read as EOF -- and a client that half-closes and
+    # then waits is rare; nginx treats the same EOF as the client closing the
+    # request (499). -t 1 never notices either way.
+    origin.hold()
+    s2 = Server(binary, [demdir, held_index], "-t", "2")
+    half = socket.create_connection(("127.0.0.1", s2.port))
+    half.sendall(("POST /v1/elevations HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n%s"
+                  % (len(abandoned), abandoned)).encode())
+    check("the half-closed lookup is held", True, origin.await_waiting(1))
+    half.shutdown(socket.SHUT_WR)
+    time.sleep(0.5)
+    origin.release()
+    deadline = time.time() + 10
+    while time.time() < deadline and line not in s2.output():
+        time.sleep(0.05)
+    check("a half-closed connection counts as gone", True, line in s2.output())
+    half.close()
+    check_shutdown("half-closed lookup", s2)
+
     # Control: the same request, left open, runs to the end.
     s = Server(binary, [demdir, held_index], "-t", "2")
     status, answer = s.post(abandoned)
     check("control: kept open, every point answered", (200, points), (status, len(answer or [])))
     check("control: nothing abandoned", False, "Abandoned" in s.output())
     check_shutdown("control, kept open", s)
+
+    # Four workers opening the same dataset at the same moment: each has its
+    # own handle, but building one goes through state GDAL and PROJ share, and
+    # this is where ThreadSanitizer caught two workers racing.
+    origin.hold()
+    s = Server(binary, [demdir, held_index], "-t", "4")
+    racers = [in_background(s, REMOTE) for _ in range(4)]
+    check("four first opens held at once", True, origin.await_waiting(4))
+    origin.release()
+    for t, _ in racers:
+        t.join(30)
+    check("each answers from its own handle", [(200, [2222])] * 4, [box.get("r") for _, box in racers])
+    check_shutdown("simultaneous first opens", s)
 
     # Shutdown with lookups in flight and one queued behind them: the workers
     # are joined and every job is freed, whichever state it was in.
