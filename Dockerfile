@@ -23,7 +23,7 @@ LABEL org.opencontainers.image.title="demd" \
       org.opencontainers.image.version="${GIT_TAG}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgdal34t64 libevent-2.1-7t64 libjson-c5 \
+        libgdal34t64 libevent-2.1-7t64 libevent-pthreads-2.1-7t64 libjson-c5 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /source/demd /usr/sbin/demd

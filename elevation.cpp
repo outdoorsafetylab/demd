@@ -16,6 +16,7 @@
 #endif
 
 #include "context.h"
+#include "pool.h"
 
 #include "elevation.h"
 
@@ -23,14 +24,17 @@ static const char *contentType = "application/json; charset=utf-8";
 
 static int coordValue(json_object *obj, double *val);
 static int detailRequested(struct evhttp_request *req, int *detail);
+static void jobFree(struct elevation_job *job);
 
+// The checks that need no body parsed happen here, on the loop thread, so a
+// request that fails them never occupies a worker. Everything else -- parsing,
+// the lookups, serialising -- is ElevationCompute(), which runs here too unless
+// there is a pool to hand it to.
 void elevation_request_cb(struct evhttp_request *req, void *arg) {
-    context *ctx = (context *)arg;
-    char *data = NULL;
-    json_object *coords, *json = NULL, *result = NULL;
-    json_tokener *tok = NULL;
-    size_t len, end, n, max;
-    evbuffer *input, *output = NULL;
+    struct elevation_server *server = (struct elevation_server *) arg;
+    struct elevation_job *job = NULL;
+    size_t len;
+    evbuffer *input;
 
     switch (evhttp_request_get_command(req)) {
     case EVHTTP_REQ_POST:
@@ -40,7 +44,7 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
         return;
     }
 
-    const char *auth = ContextAuth(ctx);
+    const char *auth = ContextAuth(server->ctx);
     if (auth) {
         struct evkeyvalq *headers = evhttp_request_get_input_headers(req);
         const char *value = evhttp_find_header(headers, "Authorization");
@@ -58,37 +62,57 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
         return;
     }
 
-    output = evbuffer_new();
-    if (!output) {
-        fprintf(stderr, "Failed to allocate output buffer: %s\n", strerror(errno));
-        goto err;
-    }
-
     input = evhttp_request_get_input_buffer(req);
     if (!input) {
         fprintf(stderr, "Failed to get input buffer: %s\n", strerror(errno));
-        goto err;
+        evhttp_send_error(req, 500, NULL);
+        return;
     }
 
     len = evbuffer_get_length(input);
     if (len == 0) {
         evhttp_send_error(req, 400, NULL);
-        goto done;
+        return;
     }
     if (len > INT_MAX) {
         evhttp_send_error(req, 413, NULL);
-        goto done;
+        return;
     }
 
-    data = (char *) malloc(len);
-    if (!data) {
+    job = (struct elevation_job *) calloc(1, sizeof(struct elevation_job));
+    if (!job) {
+        fprintf(stderr, "Failed to allocate job: %s\n", strerror(errno));
+        evhttp_send_error(req, 500, NULL);
+        return;
+    }
+    job->req = req;
+    job->detail = detail;
+    job->len = len;
+    job->body = (char *) malloc(len);
+    if (!job->body) {
         fprintf(stderr, "Failed to allocate %zu bytes for input: %s\n", len, strerror(errno));
-        goto err;
+        ElevationAbort(job, 500);
+        return;
     }
-    if (evbuffer_copyout(input, data, len) != (ev_ssize_t) len) {
+    if (evbuffer_copyout(input, job->body, len) != (ev_ssize_t) len) {
         fprintf(stderr, "Failed to drain input buffer: %s\n", strerror(errno));
-        goto err;
+        ElevationAbort(job, 500);
+        return;
     }
+
+    if (server->pool) {
+        PoolSubmit(server->pool, job);
+    } else {
+        ElevationCompute(server->ctx, job);
+        ElevationFinish(job);
+    }
+}
+
+void ElevationCompute(struct context *ctx, struct elevation_job *job) {
+    json_object *coords, *json = NULL, *result = NULL;
+    json_tokener *tok = NULL;
+    size_t len = job->len, end, n, max;
+    const char *data = job->body;
 
     // Parse with an explicit length: the buffer is not NUL-terminated, so the
     // string-oriented entry points would read past the end of the allocation.
@@ -101,7 +125,7 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
     if (!json) {
         fprintf(stderr, "Failed to parse input buffer: %s\n",
             json_tokener_error_desc(json_tokener_get_error(tok)));
-        evhttp_send_error(req, 400, NULL);
+        job->status = 400;
         goto done;
     }
 
@@ -112,12 +136,12 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
         end++;
     }
     if (end != len) {
-        evhttp_send_error(req, 400, NULL);
+        job->status = 400;
         goto done;
     }
 
     if (!json_object_is_type(json, json_type_array)) {
-        evhttp_send_error(req, 400, NULL);
+        job->status = 400;
         goto done;
     }
 
@@ -125,11 +149,16 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
     max = ContextMaxPoints(ctx);
     if (max > 0 && n > max) {
         fprintf(stderr, "Rejected request of %zu point(s), limit is %zu\n", n, max);
-        evhttp_send_error(req, 413, NULL);
+        job->status = 413;
         goto done;
     }
     if (n == 0) {
-        evbuffer_add(output, "[]", 2);
+        job->reply = strdup("[]");
+        if (!job->reply) {
+            fprintf(stderr, "Failed to allocate reply: %s\n", strerror(errno));
+            goto err;
+        }
+        job->reply_len = 2;
     } else {
         struct timeval start, end;
         gettimeofday(&start, NULL);
@@ -140,18 +169,25 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
         }
         ContextResetConsidered(ctx);
         for (size_t i = 0; i < n; i++) {
+            // Only ever set when a pool is in use: the client closed the
+            // connection, so the rest of this lookup would be for no one.
+            if (__atomic_load_n(&job->cancelled, __ATOMIC_RELAXED)) {
+                fprintf(stderr, "Abandoned request of %zu point(s) after %zu: client went away\n", n, i);
+                job->status = 0;
+                goto done;
+            }
             coords = json_object_array_get_idx(json, i);
             // json-c represents JSON null as a NULL pointer, and its array
             // accessors are unchecked, so the type has to be proven first.
             if (!coords || !json_object_is_type(coords, json_type_array)
                     || json_object_array_length(coords) != 2) {
-                evhttp_send_error(req, 400, NULL);
+                job->status = 400;
                 goto done;
             }
             double xVal, yVal;
             if (!coordValue(json_object_array_get_idx(coords, 0), &xVal)
                     || !coordValue(json_object_array_get_idx(coords, 1), &yVal)) {
-                evhttp_send_error(req, 400, NULL);
+                job->status = 400;
                 goto done;
             }
             const char *src = NULL;
@@ -160,7 +196,7 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
             if (!isnan(alt)) {
                 val = json_object_new_double(alt);
             }
-            if (detail) {
+            if (job->detail) {
                 // {"m": value, "src": layer}, or {"m": null} with no src: a
                 // point nothing covers has no source to name.
                 json_object *point = json_object_new_object();
@@ -177,12 +213,16 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
             }
             json_object_array_add(result, val);
         }
-        const char *string = json_object_to_json_string(result);
-        if (evbuffer_add(output, string, strlen(string)) != 0
-                || evbuffer_add(output, "\n", 1) != 0) {
+        size_t slen;
+        const char *string = json_object_to_json_string_length(result, JSON_C_TO_STRING_SPACED, &slen);
+        job->reply = (char *) malloc(slen + 1);
+        if (!job->reply) {
             fprintf(stderr, "Failed to dump JSON string: %s\n", strerror(errno));
             goto err;
         }
+        memcpy(job->reply, string, slen);
+        job->reply[slen] = '\n';
+        job->reply_len = slen + 1;
         gettimeofday(&end, NULL);
         time_t sec = end.tv_sec - start.tv_sec;
         time_t usec = end.tv_usec - start.tv_usec;
@@ -199,15 +239,11 @@ void elevation_request_cb(struct evhttp_request *req, void *arg) {
                 n, sec, usec, ContextConsidered(ctx));
         }
     }
-    evhttp_add_header(evhttp_request_get_output_headers(req), "Content-Type", contentType);
-    evhttp_send_reply(req, 200, "OK", output);
+    job->status = 200;
     goto done;
 err:
-    evhttp_send_error(req, 500, NULL);
+    job->status = 500;
 done:
-    if (output) {
-        evbuffer_free(output);
-    }
     if (result) {
         json_object_put(result);
     }
@@ -217,9 +253,41 @@ done:
     if (tok) {
         json_tokener_free(tok);
     }
-    if (data) {
-        free(data);
+}
+
+void ElevationFinish(struct elevation_job *job) {
+    struct evhttp_request *req = job->req;
+    if (job->status == 0) {
+        // Abandoned. Nobody reads this, but the request still has to be
+        // answered: that is what makes libevent free it.
+        evhttp_send_error(req, 503, NULL);
+    } else if (job->status != 200) {
+        evhttp_send_error(req, job->status, NULL);
+    } else {
+        evbuffer *output = evbuffer_new();
+        if (!output || evbuffer_add(output, job->reply, job->reply_len) != 0) {
+            fprintf(stderr, "Failed to allocate output buffer: %s\n", strerror(errno));
+            evhttp_send_error(req, 500, NULL);
+        } else {
+            evhttp_add_header(evhttp_request_get_output_headers(req), "Content-Type", contentType);
+            evhttp_send_reply(req, 200, "OK", output);
+        }
+        if (output) {
+            evbuffer_free(output);
+        }
     }
+    jobFree(job);
+}
+
+void ElevationAbort(struct elevation_job *job, int status) {
+    job->status = status;
+    ElevationFinish(job);
+}
+
+void jobFree(struct elevation_job *job) {
+    free(job->body);
+    free(job->reply);
+    free(job);
 }
 
 // Accepts only JSON numbers. json_object_get_double() coerces anything else to
