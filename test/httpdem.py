@@ -14,6 +14,7 @@ import http.server
 import os
 import re
 import threading
+import time
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -29,6 +30,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if self.path != "/" + os.path.basename(self.server.dem_path):
             self.send_error(404)
             return
+        with self.server.lock:
+            self.server.waiting += 1
+        self.server.gate.wait()
+        with self.server.lock:
+            self.server.waiting -= 1
         self.server.requests += 1
         data = self._body()
         total = len(data)
@@ -63,13 +69,22 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 
 class Origin:
-    """Serves `path` at http://127.0.0.1:<port>/<basename>, counting requests."""
+    """Serves `path` at http://127.0.0.1:<port>/<basename>, counting requests.
+
+    hold() makes every request wait until release(), which is how a test gets
+    a lookup that is still running, for exactly as long as it wants: timing a
+    large request instead would make the result depend on the machine."""
 
     def __init__(self, path):
         self.path = path
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.server.daemon_threads = True
         self.server.dem_path = path
         self.server.requests = 0
+        self.server.waiting = 0
+        self.server.lock = threading.Lock()
+        self.server.gate = threading.Event()
+        self.server.gate.set()
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -85,7 +100,24 @@ class Origin:
     def reset(self):
         self.server.requests = 0
 
+    def hold(self):
+        self.server.gate.clear()
+
+    def release(self):
+        self.server.gate.set()
+
+    def await_waiting(self, n, timeout=10):
+        """True once `n` requests are held at the gate."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.server.lock:
+                if self.server.waiting >= n:
+                    return True
+            time.sleep(0.02)
+        return False
+
     def stop(self):
+        self.release()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)

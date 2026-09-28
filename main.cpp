@@ -16,6 +16,7 @@
 #include <event2/event.h>
 #include <event2/buffer.h>
 #include <event2/http.h>
+#include <event2/thread.h>
 #include <json-c/json.h>
 
 #include "elevation.h"
@@ -23,6 +24,7 @@
 #include "paths.h"
 #include "index.h"
 #include "srs.h"
+#include "pool.h"
 
 static void do_term(int sig, short events, void *arg) {
     (void) events;
@@ -38,6 +40,7 @@ static const char *defaultURI = "/v1/elevations";
 static const char *defaultAuth = "";
 static const long defaultMaxPoints = 100000;
 static const long defaultMaxOpen = 500;
+static const long defaultThreads = 1;
 
 static long parseCount(const char *arg, const char *flag, long ceiling);
 static int collectSources(int fromStdin, char **argv, int argc, char ***out, size_t *outn);
@@ -47,6 +50,9 @@ static void usage(const char *argv0);
 
 int main(int argc, char **argv) {
     struct context *ctx = NULL;
+    struct context **workerContexts = NULL;
+    struct pool *pool = NULL;
+    struct elevation_server server = {NULL, NULL};
     struct event_base *base = NULL;
     struct evhttp *http = NULL;
     struct evhttp_bound_socket *handle = NULL;
@@ -54,6 +60,7 @@ int main(int argc, char **argv) {
     int opt, ret = 0, port = defaultPort, verbose = 1;
     long maxPoints = defaultMaxPoints;
     long maxOpen = defaultMaxOpen;
+    long threads = defaultThreads;
     int fromStdin = 0;
     const char **paths = NULL;
     size_t npaths = 0;
@@ -70,7 +77,7 @@ int main(int argc, char **argv) {
         {NULL, 0, NULL, 0},
     };
 
-    while ((opt = getopt_long(argc, argv, "a:p:u:s:A:m:n:w:W:P:q", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "a:p:u:s:A:m:n:t:w:W:P:q", longopts, NULL)) != -1) {
         switch (opt) {
             case 'a': addr = optarg; break;
             case 'p': port = atoi(optarg); break;
@@ -89,6 +96,13 @@ int main(int argc, char **argv) {
                 break;
             case 'n':
                 maxOpen = parseCount(optarg, "-n", 1000000);
+                break;
+            case 't':
+                threads = parseCount(optarg, "-t", 256);
+                if (threads < 1) {
+                    fprintf(stderr, "Invalid -t value: %s\n", optarg);
+                    return 1;
+                }
                 break;
             case 'q': verbose = 0; break;
             default : fprintf(stderr, "Unknown option %c\n", opt); break;
@@ -177,6 +191,34 @@ int main(int argc, char **argv) {
         goto err;
     }
 
+    // Each worker gets a context of its own, because a context holds GDAL
+    // dataset handles and one handle cannot be read from two threads at once.
+    // The first worker takes the one above; the rest are loaded the same way.
+    if (threads > 1) {
+        workerContexts = (struct context **) calloc((size_t) threads, sizeof(struct context *));
+        if (!workerContexts) {
+            fprintf(stderr, "Failed to allocate %ld context(s): %s\n", threads, strerror(errno));
+            ret = 1;
+            goto err;
+        }
+        for (long i = 1; i < threads; i++) {
+            workerContexts[i] = ContextCreate(paths, npaths, srs, auth, (size_t) maxOpen);
+            if (!workerContexts[i]) {
+                ret = 1;
+                goto err;
+            }
+            ContextSetMaxPoints(workerContexts[i], (size_t) maxPoints);
+            ContextSetVerbose(workerContexts[i], verbose);
+        }
+        // Before event_base_new(): only a base created after this has the
+        // locking that lets workers wake it with event_active().
+        if (evthread_use_pthreads() != 0) {
+            fprintf(stderr, "Failed to enable libevent threading\n");
+            ret = 1;
+            goto err;
+        }
+    }
+
     if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
         fprintf(stderr, "Failed to ignore SIGPIPE: %s\n", strerror(errno));
         ret = 1;
@@ -204,7 +246,24 @@ int main(int argc, char **argv) {
     }
     evhttp_set_max_headers_size(http, 16384);
 
-    evhttp_set_cb(http, uri, elevation_request_cb, ctx);
+    // With a pool, the loop thread still reads auth from the first worker's
+    // context. That is safe only because auth never changes after
+    // ContextCreate(); nothing else of it is touched here.
+    server.ctx = ctx;
+    if (workerContexts) {
+        // The pool owns every context from here on, whether or not it starts.
+        workerContexts[0] = ctx;
+        ctx = NULL;
+        pool = PoolCreate(base, workerContexts, (size_t) threads);
+        free(workerContexts);
+        workerContexts = NULL;
+        if (!pool) {
+            ret = 1;
+            goto err;
+        }
+        server.pool = pool;
+    }
+    evhttp_set_cb(http, uri, elevation_request_cb, &server);
 
     handle = evhttp_bind_socket_with_handle(http, addr, port);
     if (!handle) {
@@ -228,10 +287,26 @@ int main(int argc, char **argv) {
         goto err;
     }
 
+    if (pool) {
+        fprintf(stderr, "Started %ld lookup threads\n", threads);
+    }
     fprintf(stderr, "Serving http://%s:%d%s\n", addr, port, uri);
     ret = event_base_dispatch(base);
 
 err:
+    // Before evhttp_free(): jobs still in the pool are answered through their
+    // connections, which evhttp_free() tears down.
+    if (pool) {
+        PoolFree(pool);
+    }
+    if (workerContexts) {
+        for (long i = 0; i < threads; i++) {
+            if (workerContexts[i]) {
+                ContextFree(workerContexts[i]);
+            }
+        }
+        free(workerContexts);
+    }
     if (http) {
         evhttp_free(http);
     }
@@ -387,7 +462,8 @@ void usage(const char *argv0) {
     fprintf(stdout, "    -s <SRS>  : SRS of requested coordinates (default: %s)\n", defaultSRS);
     fprintf(stdout, "    -A <auth> : 'Authorization' header to control access, 401 status will be replied if not matched. (default: none)\n");
     fprintf(stdout, "    -m <max>  : Maximum number of points per request, 0 for unlimited (default: %ld)\n", defaultMaxPoints);
-    fprintf(stdout, "    -n <max>  : Maximum DEM files kept open at once, 0 for unlimited (default: %ld)\n", defaultMaxOpen);
+    fprintf(stdout, "    -n <max>  : Maximum DEM files kept open at once, per lookup thread, 0 for unlimited (default: %ld)\n", defaultMaxOpen);
+    fprintf(stdout, "    -t <n>    : Lookup threads; 1 answers on the event loop thread itself (default: %ld)\n", defaultThreads);
     fprintf(stdout, "    -q        : Do not log every lookup\n");
     fprintf(stdout, "\n");
     fprintf(stdout, "Index modes (build time, not serving):\n");

@@ -43,6 +43,12 @@ jobs:
       - name: Build and test with ASan/UBSan
         run: make test/sanitize
 
+      # Lookups on worker threads: a context or job reached from two threads
+      # at once is a data race, and only TSan sees one that happens not to
+      # corrupt anything on this run.
+      - name: Build and test with TSan
+        run: make test/tsan
+
   stress:
     name: Stress tool
     runs-on: ubuntu-24.04

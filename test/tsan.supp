@@ -1,0 +1,8 @@
+# ThreadSanitizer suppressions for `make test/tsan`.
+#
+# GDAL takes two of its own internal mutexes in both orders during startup
+# (CPLCreateOrAcquireMutexEx / CPLAcquireMutex), on the main thread and before
+# demd starts a single worker: `-t 1` reports it too. GDAL is not built with
+# TSan, so this is not something demd can fix or even see into; suppressing it
+# by library keeps any inversion involving demd's own locks reportable.
+deadlock:libgdal.so

@@ -51,7 +51,8 @@ Options:
     -s <SRS>  : SRS of requested coordinates (default: WGS84)
     -A <auth> : 'Authorization' header to control access, 401 status will be replied if not matched. (default: none)
     -m <max>  : Maximum number of points per request, 0 for unlimited (default: 100000)
-    -n <max>  : Maximum DEM files kept open at once, 0 for unlimited (default: 500)
+    -n <max>  : Maximum DEM files kept open at once, per lookup thread, 0 for unlimited (default: 500)
+    -t <n>    : Lookup threads; 1 answers on the event loop thread itself (default: 1)
     -q        : Do not log every lookup
 
 Index modes (build time, not serving):
@@ -203,13 +204,45 @@ many are held at once (500 by default), closing the least recently used beyond
 that. A file that fails to open is retried with a backoff rather than written
 off, because in object storage most failures are temporary.
 
+The cap is per lookup thread (below): with `-t 4 -n 500`, up to 2,000 files
+can be open at once.
+
+# Lookup threads
+
+By default every lookup runs on the one thread that also handles HTTP, so a
+request of many points holds up every request behind it, one-point queries
+included. Over remote data, where a block's first read is a round trip, that
+wait gets long. `-t <n>` moves lookups to `n` worker threads instead:
+
+- The event loop keeps all HTTP I/O. It checks the method, auth and `detail`,
+  then queues the body. Any idle worker takes the next request, so a slow one
+  occupies one worker and nothing else.
+- **Each worker has its own copy of the loaded datasets**, with its own GDAL
+  handles and its own `-n` budget. A GDAL dataset handle cannot be read from
+  two threads at once. GDAL's block cache is still shared across threads.
+  Startup loads the paths once per worker. With an index that is cheap. Without
+  one, every file is opened `n` times.
+- **A lookup whose client has gone away stops** at the next point instead of
+  running to the end. This is what frees a worker when a proxy's timeout gives
+  up on a request: the proxy closes the connection, and nothing would ever read
+  the rest. A client that only half-closes (`shutdown(SHUT_WR)`) and then waits
+  for the reply looks the same from the socket, so it is treated as gone too,
+  as nginx does (499). `-t 1` never notices either.
+- Replies are byte-for-byte those of `-t 1`, errors included.
+
+Keep `-m`: without a per-request cap, `n` large requests still occupy every
+worker. And allow the platform at most as many concurrent requests per
+instance as there are workers (e.g. Cloud Run's `--concurrency`), or the extra
+ones queue exactly as before.
+
 # How to test
 
 The test suite synthesizes its own DEM tiles, so no data needs to be downloaded:
 
 ```shell
-make test           # end-to-end tests against a normal build
+make test           # end-to-end tests against a normal build, then again with -t 4
 make test/sanitize  # the same tests under AddressSanitizer and UBSan
+make test/tsan      # the -t 4 run under ThreadSanitizer
 ```
 
 `make test/sanitize` is the one that matters for memory safety — `-Wall -Wextra`
@@ -220,7 +253,7 @@ does not detect the class of bug the suite guards against. Both run in CI.
 If development packages was not installed, you may need the follow runtime dependency packages installed:
 
 ```shell
-sudo apt-get install libgdal34t64 libevent-2.1-7t64 libjson-c5
+sudo apt-get install libgdal34t64 libevent-2.1-7t64 libevent-pthreads-2.1-7t64 libjson-c5
 ```
 
 Or use `serve` target in `Makefile` to automatically download sample DEM files before starting the daemon:

@@ -7,6 +7,7 @@ in the server's output.
 
     usage: run.py <path-to-demd>
 """
+import http.client
 import json
 import os
 import re
@@ -15,11 +16,15 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Extra arguments for every server the suite starts, e.g. DEMD_ARGS="-t 4" to
+# run the whole suite again with lookups on worker threads.
+EXTRA_ARGS = os.environ.get("DEMD_ARGS", "").split()
 AUTH = "Bearer test-token"
 
 failures = []
@@ -49,7 +54,7 @@ class Server:
         self.port = free_port()
         self.log = tempfile.TemporaryFile(mode="w+")
         self.proc = subprocess.Popen(
-            [binary, "-p", str(self.port), *args, *dems],
+            [binary, "-p", str(self.port), *EXTRA_ARGS, *args, *dems],
             stdout=self.log, stderr=subprocess.STDOUT,
         )
         self.url = "http://127.0.0.1:%d/v1/elevations" % self.port
@@ -72,14 +77,15 @@ class Server:
         except urllib.error.HTTPError as e:
             return e.code, None
 
-    def post(self, body, method="POST", headers=None, query=""):
-        """Returns (status, parsed-body-or-None). Never raises for HTTP errors."""
+    def post(self, body, method="POST", headers=None, query="", timeout=20):
+        """Returns (status, parsed-body-or-None). Never raises for HTTP errors.
+        A timeout comes back as (None, "timeout")."""
         data = body if isinstance(body, bytes) else body.encode()
         req = urllib.request.Request(self.url + query, data=data, method=method)
         for k, v in (headers or {}).items():
             req.add_header(k, v)
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode().strip()
                 try:
                     return resp.status, json.loads(raw)
@@ -88,6 +94,10 @@ class Server:
         except urllib.error.HTTPError as e:
             return e.code, None
         except urllib.error.URLError as e:
+            return None, str(e)
+        except (socket.timeout, TimeoutError):
+            return None, "timeout"
+        except (ConnectionError, http.client.HTTPException) as e:
             return None, str(e)
 
     def alive(self):
@@ -176,7 +186,7 @@ def open_dem_files(pid):
 
 
 def check_no_sanitizer(name, output):
-    for marker in ("AddressSanitizer", "LeakSanitizer", "runtime error:",
+    for marker in ("AddressSanitizer", "LeakSanitizer", "ThreadSanitizer", "runtime error:",
                    "detected memory leaks"):
         if marker in output:
             print("  FAIL  %-46s sanitizer output:" % name)
@@ -197,11 +207,15 @@ def check_shutdown(name, server, sig=signal.SIGTERM):
 def check_clean(name, server):
     """Sanitizer reports go to the server's stderr, not to any response."""
     out = server.output()
-    for marker in ("AddressSanitizer", "LeakSanitizer", "runtime error:",
+    for marker in ("AddressSanitizer", "LeakSanitizer", "ThreadSanitizer", "runtime error:",
                    "Segmentation fault", "MemorySanitizer"):
         if marker in out:
+            # From the report's start: its first stack is the access that
+            # raced or faulted, and the tail alone cuts it off.
+            lines = out.splitlines()
+            start = next((i for i, l in enumerate(lines) if marker in l or "WARNING:" in l), 0)
             print("  FAIL  %-46s sanitizer/crash output:" % name)
-            print("\n".join("        " + l for l in out.splitlines()[-30:]))
+            print("\n".join("        " + l for l in lines[max(0, start - 2):start + 60]))
             failures.append(name)
             return
     check(name, True, True)
@@ -678,7 +692,9 @@ def main(binary):
     run_cli(binary, "-w", index_of(capdir), capdir)
     NORTH, MIDDLE, SOUTH = "[[121.0,23.0]]", "[[121.0,18.0]]", "[[121.0,12.0]]"
 
-    s = Server(binary, capdir, "-n", "1")
+    # The cap is per lookup thread, so it is pinned to one here: this checks
+    # the cap itself. How it combines with -t is checked under "lookup threads".
+    s = Server(binary, capdir, "-n", "1", "-t", "1")
     check("stacked tiles: northern", [1111], s.post(NORTH)[1])
     check("stacked tiles: middle", [2222], s.post(MIDDLE)[1])
     check("stacked tiles: southern", [3333], s.post(SOUTH)[1])
@@ -849,6 +865,8 @@ def main(binary):
           [{"m": 9999, "src": "N23E120"}], s.post("[[120.75,23.75]]", query="?detail=1")[1])
     check_shutdown("detail over a single file", s)
 
+    threads_section(binary, demdir)
+
     print()
     if failures:
         print("FAILED %d of %d checks:" % (len(failures), checks))
@@ -857,6 +875,166 @@ def main(binary):
         return 1
     print("PASSED all %d checks" % checks)
     return 0
+
+
+def threads_section(binary, demdir):
+    print("== lookup threads ==")
+    for bad in ("0", "x", "", "257"):
+        code, _ = run_cli(binary, "-t", bad, demdir)
+        check("-t %r is refused" % bad, 1, code)
+
+    # Workers are an implementation detail: every answer, error included, has
+    # to be the one the loop thread gives. Byte comparison, because a worker
+    # that serialised with other json-c flags would still parse the same.
+    one = Server(binary, demdir, "-t", "1", "-m", "10")
+    four = Server(binary, demdir, "-t", "4", "-m", "10")
+    body = "[[120.25,23.75],[120.75,23.25],[0.0,0.0],[120.5,23.5]]"
+    for name, args in (("values", (body,)), ("detail", (body, "?detail=1")),
+                       ("empty array", ("[]",)), ("malformed", ("[[1,",)),
+                       ("over -m", ("[" + ",".join(["[120.5,23.5]"] * 11) + "]",))):
+        check("-t 4 answers %s as -t 1 does" % name, one.raw(*args), four.raw(*args))
+    check("-t 4 refuses GET as -t 1 does", one.post("[]", method="GET")[0],
+          four.post("[]", method="GET")[0])
+    check_shutdown("-t 1 reference", one)
+    check_shutdown("-t 4", four)
+
+    # The open-file cap is per thread: each worker has its own dataset handles.
+    capdir = tempfile.mkdtemp(prefix="demd-test-tcap-")
+    mktif(os.path.join(capdir, "a.tif"), "--value", "1111")
+    mktif(os.path.join(capdir, "b.tif"), "--value", "2222", "--shift", "-600000")
+    mktif(os.path.join(capdir, "c.tif"), "--value", "3333", "--shift", "-1200000")
+    run_cli(binary, "-w", index_of(capdir), capdir)
+    s = Server(binary, capdir, "-n", "1", "-t", "3")
+    answers = []
+    for _ in range(10):
+        for point in ("[[121.0,23.0]]", "[[121.0,18.0]]", "[[121.0,12.0]]"):
+            answers.append(s.post(point)[1])
+    check("three threads answer every tile", [[1111], [2222], [3333]] * 10, answers)
+    held = open_dem_files(s.proc.pid)
+    if held is not None:
+        check("-n 1 -t 3 holds at most three DEMs open", True, 1 <= len(held) <= 3)
+    check_shutdown("per-thread cap", s)
+
+    # The rest needs a lookup that is still running, held for exactly as long
+    # as the check wants: a remote DEM whose origin answers only on release().
+    # The local tile comes first, so a point on it never touches the origin.
+    sys.path.insert(0, HERE)
+    import httpdem
+    remotedir = tempfile.mkdtemp(prefix="demd-test-held-")
+    mktif(os.path.join(remotedir, "held.tif"), "--value", "2222", "--shift", "-600000")
+    origin = httpdem.Origin(os.path.join(remotedir, "held.tif"))
+    held_index = os.path.join(remotedir, "held.index")
+    check("held index written", 0,
+          run_cli(binary, "-w", held_index, "--from-stdin", stdin=origin.url + "\n")[0])
+    LOCAL, REMOTE = "[[120.25,23.75]]", "[[121.0,18.0]]"
+
+    def in_background(server, body):
+        box = {}
+        t = threading.Thread(target=lambda: box.update(r=server.post(body, timeout=60)))
+        t.start()
+        return t, box
+
+    # A small request is answered while a large one is still running.
+    origin.hold()
+    s = Server(binary, [demdir, held_index], "-t", "2")
+    slow, slow_box = in_background(s, REMOTE)
+    check("the slow lookup is held at the origin", True, origin.await_waiting(1))
+    check("a local point is answered meanwhile", (200, [1000]), s.post(LOCAL, timeout=5))
+    check("while the slow one is still running", True, slow.is_alive())
+    origin.release()
+    slow.join(30)
+    check("the slow one completes on release", (200, [2222]), slow_box.get("r"))
+    check_shutdown("no head-of-line blocking", s)
+
+    # The control: on one thread the same small request has to wait. Without
+    # it, the check above could pass because the slow lookup was never slow.
+    origin.hold()
+    s = Server(binary, [demdir, held_index], "-t", "1")
+    slow, slow_box = in_background(s, REMOTE)
+    check("control: the slow lookup is held", True, origin.await_waiting(1))
+    check("control: -t 1 cannot answer meanwhile", None, s.post(LOCAL, timeout=1.5)[0])
+    origin.release()
+    slow.join(30)
+    check("control: the slow one completes", (200, [2222]), slow_box.get("r"))
+    check_shutdown("control, one thread", s)
+
+    # A client that gives up frees its worker: a proxy's timeout closes the
+    # connection, and the rest of the lookup would be for no one.
+    points = 1000
+    abandoned = "[" + ",".join(["[121.0,18.0]"] + ["[120.25,23.75]"] * (points - 1)) + "]"
+    origin.hold()
+    s = Server(binary, [demdir, held_index], "-t", "2")
+    sock = socket.create_connection(("127.0.0.1", s.port))
+    sock.sendall(("POST /v1/elevations HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n%s"
+                  % (len(abandoned), abandoned)).encode())
+    check("the abandoned lookup is held", True, origin.await_waiting(1))
+    sock.close()
+    time.sleep(0.5)  # the close has to reach the loop before the lookup resumes
+    origin.release()
+    line = "Abandoned request of %d point(s) after 1" % points
+    deadline = time.time() + 10
+    while time.time() < deadline and line not in s.output():
+        time.sleep(0.05)
+    check("a closed connection stops the lookup", True, line in s.output())
+    check("and the server still answers", (200, [1000]), s.post(LOCAL))
+    check_shutdown("abandoned lookup", s)
+
+    # A half-close counts as gone. From the socket alone it cannot be told from
+    # a full close -- both read as EOF -- and a client that half-closes and
+    # then waits is rare; nginx treats the same EOF as the client closing the
+    # request (499). -t 1 never notices either way.
+    origin.hold()
+    s2 = Server(binary, [demdir, held_index], "-t", "2")
+    half = socket.create_connection(("127.0.0.1", s2.port))
+    half.sendall(("POST /v1/elevations HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n%s"
+                  % (len(abandoned), abandoned)).encode())
+    check("the half-closed lookup is held", True, origin.await_waiting(1))
+    half.shutdown(socket.SHUT_WR)
+    time.sleep(0.5)
+    origin.release()
+    deadline = time.time() + 10
+    while time.time() < deadline and line not in s2.output():
+        time.sleep(0.05)
+    check("a half-closed connection counts as gone", True, line in s2.output())
+    half.close()
+    check_shutdown("half-closed lookup", s2)
+
+    # Control: the same request, left open, runs to the end.
+    s = Server(binary, [demdir, held_index], "-t", "2")
+    status, answer = s.post(abandoned)
+    check("control: kept open, every point answered", (200, points), (status, len(answer or [])))
+    check("control: nothing abandoned", False, "Abandoned" in s.output())
+    check_shutdown("control, kept open", s)
+
+    # Four workers opening the same dataset at the same moment: each has its
+    # own handle, but building one goes through state GDAL and PROJ share, and
+    # this is where ThreadSanitizer caught two workers racing.
+    origin.hold()
+    s = Server(binary, [demdir, held_index], "-t", "4")
+    racers = [in_background(s, REMOTE) for _ in range(4)]
+    check("four first opens held at once", True, origin.await_waiting(4))
+    origin.release()
+    for t, _ in racers:
+        t.join(30)
+    check("each answers from its own handle", [(200, [2222])] * 4, [box.get("r") for _, box in racers])
+    check_shutdown("simultaneous first opens", s)
+
+    # Shutdown with lookups in flight and one queued behind them: the workers
+    # are joined and every job is freed, whichever state it was in.
+    origin.hold()
+    s = Server(binary, [demdir, held_index], "-t", "2")
+    clients = [in_background(s, REMOTE) for _ in range(2)]
+    check("two lookups held", True, origin.await_waiting(2))
+    queued = in_background(s, LOCAL)
+    time.sleep(0.3)
+    s.proc.send_signal(signal.SIGTERM)
+    time.sleep(0.3)
+    origin.release()
+    check("shutdown with work in flight: clean exit", 0, s.shutdown())
+    check_clean("shutdown with work in flight: clean after exit", s)
+    for t, _ in clients + [queued]:
+        t.join(30)
+    origin.stop()
 
 
 if __name__ == "__main__":

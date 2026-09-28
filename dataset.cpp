@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <math.h>
 #include <time.h>
+#include <pthread.h>
 
 #include <gdal.h>
 #include <cpl_conv.h>
@@ -13,9 +14,23 @@
 #include "srs.h"
 #include "dataset.h"
 
+// Serialises building and tearing down a dataset's SRS and coordinate
+// transformations across threads. With -t, several workers each open their own
+// handle to the same file, and a transformation is built from and returned to
+// state GDAL and PROJ share process-wide: GDAL caches transformations, handing
+// one back on destroy and cloning it for the next create. ThreadSanitizer
+// catches two workers racing inside PROJ there.
+//
+// GDALOpen() stays outside it. Over a network filesystem it is a round trip,
+// and a lock held across that would make every worker's open wait for one slow
+// one -- the queueing -t exists to remove. Lookups on an open dataset never
+// take it.
+static pthread_mutex_t datasetProj = PTHREAD_MUTEX_INITIALIZER;
+
 static struct dataset *datasetAlloc(const char *filename, OGRSpatialReferenceH hReqSRS);
 static int datasetLoad(struct dataset *, char *err, size_t errlen);
 static int datasetLoadQuietly(struct dataset *, char *err, size_t errlen);
+static int datasetLoadProj(struct dataset *, char *err, size_t errlen);
 static int datasetComputeBounds(struct dataset *);
 static int datasetGetCorner(struct dataset *, double *, double *);
 
@@ -107,7 +122,10 @@ void DatasetFree(struct dataset *ctx) {
     free(ctx);
 }
 
+// Closing does no I/O on a read-only dataset, so all of it can sit under the
+// lock, GDALClose() included: it destroys the dataset's own SRS.
 void DatasetClose(struct dataset *ctx) {
+    pthread_mutex_lock(&datasetProj);
     if (ctx->hCT) {
         OCTDestroyCoordinateTransformation(ctx->hCT);
         ctx->hCT = NULL;
@@ -125,6 +143,7 @@ void DatasetClose(struct dataset *ctx) {
         ctx->hSrcDS = NULL;
     }
     ctx->hBand = NULL;
+    pthread_mutex_unlock(&datasetProj);
 }
 
 int DatasetIsOpen(struct dataset *ctx) {
@@ -280,6 +299,14 @@ int datasetLoadQuietly(struct dataset *ctx, char *err, size_t errlen) {
             ctx->filename, CPLGetLastErrorMsg());
         return FALSE;
     }
+    pthread_mutex_lock(&datasetProj);
+    int ok = datasetLoadProj(ctx, err, errlen);
+    pthread_mutex_unlock(&datasetProj);
+    return ok;
+}
+
+// The part of loading that touches PROJ. Caller holds datasetProj.
+int datasetLoadProj(struct dataset *ctx, char *err, size_t errlen) {
     ctx->hFileSRS = OSRNewSpatialReference(GDALGetProjectionRef(ctx->hSrcDS));
     if (!ctx->hFileSRS) {
         snprintf(err, errlen, "Failed to create SRS of '%s': %s",
